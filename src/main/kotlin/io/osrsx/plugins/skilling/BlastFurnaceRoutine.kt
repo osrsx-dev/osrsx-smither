@@ -35,6 +35,7 @@ class BlastFurnaceRoutine(
     private val ctx: PluginContext,
     private val bar: () -> BlastBar,
     private val cofferTopUp: () -> Int,
+    private val buyOres: () -> Boolean,
     private val gearUp: () -> Long?,
     private val highlight: () -> Boolean,
     private val stats: SmitherStats,
@@ -55,6 +56,9 @@ class BlastFurnaceRoutine(
     /** Latched when a dispenser Take landed; cleared when bars reach the inventory. */
     private var taking = false
     private var takeClickedAt = 0L
+    /** The ore currently being bought from Ordan's store (null = not buying); cleared on a full load. */
+    private var buyingOre: String? = null
+    private var tradeClickedAt = 0L
 
     /** The single live target highlight — re-pointed as the current object changes (so they don't stack). */
     private var targetHl: Highlight? = null
@@ -90,6 +94,8 @@ class BlastFurnaceRoutine(
                 System.currentTimeMillis() - lastPaidMs > FOREMAN_REPAY_MS -> payForeman()
             // Finished bars in hand → bank them (also our stats tally point).
             held > 0 -> bankBars(bar)
+            // The bank ran dry and we're restocking from Ordan's ore store.
+            buyingOre != null -> buyOre()
             // Ore in hand → feed the conveyor (one click deposits the whole inventory of ore).
             holdingOre(bar) -> feedConveyor(bar)
             // Everything fed and smelted → take the batch from the dispenser.
@@ -166,6 +172,7 @@ class BlastFurnaceRoutine(
     private fun feedConveyor(bar: BlastBar): Long = ctx.profiler().section("smither/bf-feed") {
         stats.status = "feeding conveyor"
         closeBankIfOpen()?.let { return@section it }
+        closeShop()?.let { return@section it }
         val ore = oreHeld(bar)
         // A landed click is in flight: the avatar walks to the belt and unloads. Only re-click once the
         // retry window passes with the ore still in hand (the click missed / was eaten).
@@ -233,6 +240,14 @@ class BlastFurnaceRoutine(
         val oreName = if (wantCoal) "Coal" else bar.primaryOre
 
         if (bank.count(oreName) == 0) {
+            // Restock from Ordan's ore store at the furnace (he sells everything except runite): make sure
+            // a purse is carried first — his prices climb as his stock depletes.
+            if (buyOres() && oreName in ORDAN_STOCK) {
+                if (ctx.inventory().count(COINS) < ORE_BUY_COINS) return@section withdrawCoins(ORE_BUY_COINS)
+                bank.close()
+                buyingOre = oreName
+                return@section snap(300, 700)
+            }
             log.i("out of $oreName — stopping")
             bank.close()
             return@section Plugin.NO_LOOP
@@ -263,6 +278,54 @@ class BlastFurnaceRoutine(
         bank.withdraw(COINS, atLeast)
         bank.close()
         return snap(400, 1000)
+    }
+
+    /**
+     * Buy the next conveyor load of [buyingOre] from Ordan's ore store: Trade him, then a single "Buy 50"
+     * on the ore's shop slot (buys are unnoted, so it caps at the free inventory slots — one click fills
+     * the load). Done once a load is held; stops for good if he's out of stock or the coins run dry.
+     */
+    private fun buyOre(): Long = ctx.profiler().section("smither/bf-buy-ore") {
+        val ore = buyingOre ?: return@section snap(200, 400)
+        stats.status = "buying ore"
+        closeBankIfOpen()?.let { return@section it }
+
+        val have = ctx.inventory().count(ore)
+        if (have >= PRIMARY_LOAD || ctx.inventory().emptySlotCount() == 0) {
+            buyingOre = null
+            return@section closeShop() ?: snap(300, 700)
+        }
+        if (ctx.inventory().count(COINS) < 1_000) {
+            log.i("not enough coins to buy $ore — stopping")
+            closeShop()
+            return@section Plugin.NO_LOOP
+        }
+        if (!shopOpen()) {
+            // A Trade click is in flight → wait for the shop before re-clicking.
+            if (System.currentTimeMillis() - tradeClickedAt < ACTION_RETRY_MS) return@section snap(300, 800)
+            val ordan = ctx.npcs().closest(ORDAN)
+                ?: run { stats.status = "walking"; walkNear(ANCHOR); return@section snap(300, 1200) }
+            mark(ordan, Color.MAGENTA, "Trade")
+            if (ordan.interact("Trade")) tradeClickedAt = System.currentTimeMillis()
+            return@section snap(600, 1400)
+        }
+        val slot = ctx.widgets().find(ore, "Buy 50") ?: ctx.widgets().find(ore, "Buy")
+        if (slot == null) {
+            log.i("Ordan has no $ore in stock — stopping")
+            closeShop()
+            return@section Plugin.NO_LOOP
+        }
+        ctx.widgets().interact(slot, "Buy 50")
+        snap(700, 1500)
+    }
+
+    private fun shopOpen(): Boolean = ctx.widgets().isVisible(SHOP_GROUP, SHOP_FRAME)
+
+    /** If the shop window is still open, close it (Esc) and wait — clicks land "through" an open shop UI. */
+    private fun closeShop(): Long? {
+        if (!shopOpen()) return null
+        ctx.keyboard().pressEscape()
+        return snap(300, 700)
     }
 
     // ---- Helpers -------------------------------------------------------------------------------------
@@ -333,6 +396,16 @@ class BlastFurnaceRoutine(
 
         const val COINS = "Coins"
         const val FOREMAN = "Blast Furnace Foreman"
+        const val ORDAN = "Ordan" // the ore seller inside the furnace room
+        /** What Ordan's ore store stocks — everything the furnace takes except runite ore. */
+        val ORDAN_STOCK = setOf(
+            "Copper ore", "Tin ore", "Iron ore", "Silver ore", "Coal", "Gold ore", "Mithril ore", "Adamantite ore",
+        )
+        /** Purse carried before trading Ordan — his prices climb steeply as his stock depletes. */
+        const val ORE_BUY_COINS = 100_000
+        // net.runelite.api.gameval.InterfaceID.Shopmain
+        const val SHOP_GROUP = 300
+        const val SHOP_FRAME = 1
         const val FOREMAN_FEE = 2_500
         /** Re-pay a little before the foreman's 10 minutes lapse so smelting never blocks on him. */
         const val FOREMAN_REPAY_MS = 9 * 60_000L + 30_000L

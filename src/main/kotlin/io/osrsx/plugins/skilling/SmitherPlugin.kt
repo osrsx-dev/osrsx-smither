@@ -1,8 +1,11 @@
 package io.osrsx.plugins.skilling
 
+import io.osrsx.api.ItemRef
 import io.osrsx.api.profile
 import io.osrsx.config.PluginConfig
+import io.osrsx.config.and
 import io.osrsx.config.eq
+import io.osrsx.config.isTrue
 import io.osrsx.plugin.HasOverlay
 import io.osrsx.plugin.Plugin
 import io.osrsx.plugin.PluginDescriptor
@@ -33,18 +36,44 @@ class SmitherPlugin : Plugin(), HasOverlay {
         private const val ANVIL = "Anvil"
         private const val BF = "Blast Furnace"
 
+        // Memo for the live item-picker providers (queried per UI frame — see the `item` provider).
+        private const val CHOICES_TTL_MS = 1000L
+        @Volatile private var itemChoicesMetal: BarType? = null
+        @Volatile private var itemChoicesAtMs = 0L
+        @Volatile private var itemChoicesCache: List<Int> = emptyList()
+        @Volatile private var bfChoicesAtMs = 0L
+        @Volatile private var bfChoicesCache: List<Int> = emptyList()
+
         var mode by enumItem("mode", "Mode", ANVIL, listOf(ANVIL, BF),
             "Smith items at an anvil, or smelt bars at the Blast Furnace")
 
         // ---- Anvil ----
-        var bar by enumItem("bar", "Metal", BarType.BRONZE.display, BarType.displays,
-            "Which bars to smith", visibleIf = eq("mode", ANVIL))
+        // Item pickers (sprite + name), not plain enums: the Metal is the real bar item, and the Item list
+        // is the real product items for that metal — filtered live to what the account can make.
+        var bar by itemItem("bar", "Metal", BarType.BRONZE.barName,
+            "Which bars to smith",
+            choices = BarType.barNames, browse = true,
+            visibleIf = eq("mode", ANVIL))
 
-        var item by enumItem(
+        var item by itemItem(
             "item", "Item",
             description = "What to smith — only items your Smithing level allows are shown",
             visibleIf = eq("mode", ANVIL),
-        ) { ctx -> SmithProduct.optionsFor(BarType.fromDisplay(bar), ctx) }
+        ) { ctx ->
+            // The live provider is re-queried EVERY UI FRAME while the config panel is open, and the
+            // eligibility scan reads skills/worlds (client-thread hops) — uncached it stutters the whole
+            // client. Memoise on (metal, short TTL) so the panel costs at most one scan per second.
+            val metal = BarType.fromBarName(bar)
+            val now = System.currentTimeMillis()
+            if (metal != itemChoicesMetal || now - itemChoicesAtMs > CHOICES_TTL_MS) {
+                itemChoicesMetal = metal
+                itemChoicesAtMs = now
+                itemChoicesCache = SmithProduct.eligible(metal, ctx).mapNotNull { p ->
+                    ctx.itemResolver().idOf(ItemRef.ByName(p.itemName(metal))).takeIf { it >= 0 }
+                }
+            }
+            itemChoicesCache
+        }
 
         var location by enumItem(
             "location", "Location",
@@ -54,15 +83,37 @@ class SmitherPlugin : Plugin(), HasOverlay {
         ) { ctx -> AnvilSites.optionsFor(ctx) }
 
         // ---- Blast Furnace ----
-        var bfBar by enumItem(
+        var bfBar by itemItem(
             "bfBar", "Bar",
-            default = BlastBar.STEEL.display,
+            default = BlastBar.STEEL.barName,
             description = "What to smelt — only bars your Smithing level allows are shown",
             visibleIf = eq("mode", BF),
-        ) { ctx -> BlastBar.optionsFor(ctx) }
+        ) { ctx ->
+            val now = System.currentTimeMillis()
+            if (now - bfChoicesAtMs > CHOICES_TTL_MS) {
+                bfChoicesAtMs = now
+                bfChoicesCache = BlastBar.eligible(ctx).mapNotNull { b ->
+                    ctx.itemResolver().idOf(ItemRef.ByName(b.barName)).takeIf { it >= 0 }
+                }
+            }
+            bfChoicesCache
+        }
+
+        var buyBars by boolItem("buyBars", "Buy bars from GE", true,
+            "When the bank runs out of bars, buy more at the Grand Exchange instead of stopping",
+            visibleIf = eq("mode", ANVIL))
+
+        var buyBatch by intItem("buyBatch", "GE buy batch", 100, 27, 5000,
+            "How many bars to buy per Grand Exchange restock",
+            visibleIf = eq("mode", ANVIL) and isTrue("buyBars"))
 
         var cofferTopUp by intItem("cofferTopUp", "Coffer deposit (gp)", 100_000, 10_000, 10_000_000,
             "How much to put in the coffer each time it runs low (the furnace dwarves draw from it)",
+            visibleIf = eq("mode", BF))
+
+        var buyOres by boolItem("buyOres", "Buy ore from Ordan", true,
+            "When the bank runs out of ore, buy the next load from Ordan's ore store at the furnace " +
+                "instead of stopping (he stocks everything except runite)",
             visibleIf = eq("mode", BF))
 
         var iceGloves by boolItem("iceGloves", "Wear ice gloves", true,
@@ -107,13 +158,17 @@ class SmitherPlugin : Plugin(), HasOverlay {
             level = { Config.stopAtLevel }, count = { Config.stopAtCount }, minutes = { Config.stopAfterMins })
     }
 
-    private fun currentBar(): BarType = BarType.fromDisplay(Config.bar)
+    private fun currentBar(): BarType = BarType.fromBarName(Config.bar)
 
-    /** The chosen product, resolved live — a blank/stale value falls back to the first eligible line. */
-    private fun currentProduct(): SmithProduct? =
-        SmithProduct.fromDisplay(Config.item) ?: SmithProduct.eligible(currentBar(), ctx).firstOrNull()
+    /** The chosen product (the picker stores the real item name, e.g. "Steel platebody"), resolved live —
+     *  a blank/stale value falls back to the first eligible line for the metal. */
+    private fun currentProduct(): SmithProduct? {
+        val bar = currentBar()
+        return SmithProduct.entries.firstOrNull { it.itemName(bar) == Config.item }
+            ?: SmithProduct.eligible(bar, ctx).firstOrNull()
+    }
 
-    private fun currentBlastBar(): BlastBar = BlastBar.fromDisplay(Config.bfBar)
+    private fun currentBlastBar(): BlastBar = BlastBar.fromBarName(Config.bfBar)
 
     private fun gearUp(): Long? = gear.ensure()
 
@@ -123,6 +178,8 @@ class SmitherPlugin : Plugin(), HasOverlay {
             site = { AnvilSites.siteFor(ctx, Config.location) },
             bar = { currentBar() },
             product = { currentProduct() },
+            buyBars = { Config.buyBars },
+            buyBatch = { Config.buyBatch },
             gearUp = { gearUp() },
             stats = stats,
             lockInput = { Config.lockInput },
@@ -135,6 +192,7 @@ class SmitherPlugin : Plugin(), HasOverlay {
             ctx,
             bar = { currentBlastBar() },
             cofferTopUp = { Config.cofferTopUp },
+            buyOres = { Config.buyOres },
             gearUp = { gearUp() },
             highlight = { Config.highlightObjects },
             stats = stats,
