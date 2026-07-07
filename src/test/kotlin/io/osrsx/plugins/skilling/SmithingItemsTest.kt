@@ -29,6 +29,12 @@ class SmithingItemsTest {
     }
 
     @Test
+    fun `bar item names round-trip (the item-picker stored value)`() {
+        BarType.entries.forEach { assertEquals(it, BarType.fromBarName(it.barName)) }
+        BlastBar.entries.forEach { assertEquals(it, BlastBar.fromBarName(it.barName)) }
+    }
+
+    @Test
     fun `levels follow the wiki base + offset table`() {
         // Spot-checks straight off the OSRS wiki Smithing table.
         assertEquals(1, SmithProduct.DAGGER.levelFor(BarType.BRONZE))

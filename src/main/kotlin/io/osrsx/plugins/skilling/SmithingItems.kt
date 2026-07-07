@@ -30,6 +30,10 @@ enum class BarType(val display: String, val barName: String, val productPrefix: 
     companion object {
         fun fromDisplay(value: String): BarType = entries.firstOrNull { it.display == value } ?: BRONZE
         val displays: List<String> get() = entries.map { it.display }
+
+        /** The enum whose real bar item name matches [value] (the item-picker stored string), default [BRONZE]. */
+        fun fromBarName(value: String): BarType = entries.firstOrNull { it.barName == value } ?: BRONZE
+        val barNames: List<String> get() = entries.map { it.barName }
     }
 }
 
@@ -135,11 +139,16 @@ enum class BlastBar(
         fun fromDisplay(value: String): BlastBar = entries.firstOrNull { it.display == value } ?: STEEL
         val displays: List<String> get() = entries.map { it.display }
 
+        /** The enum whose real bar item name matches [value] (the item-picker stored string), default [STEEL]. */
+        fun fromBarName(value: String): BlastBar = entries.firstOrNull { it.barName == value } ?: STEEL
+
         /** The bars the account can smelt right now (Smithing level met; permissive when unreadable). */
-        fun optionsFor(ctx: PluginContext): List<String> {
+        fun eligible(ctx: PluginContext): List<BlastBar> {
             val level = ctx.skills().real(Skill.SMITHING)
-            return entries.filter { level <= 0 || level >= it.level }.map { it.display }
+            return entries.filter { level <= 0 || level >= it.level }
         }
+
+        fun optionsFor(ctx: PluginContext): List<String> = eligible(ctx).map { it.display }
     }
 }
 
