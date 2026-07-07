@@ -1,52 +1,43 @@
-# osrsx-plugin-template
+# osrsx-smither
 
-A starter for an [osrsx](https://github.com/osrsx/osrsx-client) plugin. Click **Use this template**, then
-edit `src/main/kotlin/.../PingPlugin.kt` and the `osrsxPlugin { }` block in `build.gradle`.
+Smithing plugin for [osrsx](https://github.com/osrsx/osrsx-client) with two modes, mirroring the miner's
+normal-vs-Motherlode split:
 
-## The whole build
+- **Anvil** — pick a metal, an item and a catalogued location. The bot banks bars, hammers batches out
+  at the anvils (quantity **All** through the smithing interface) and re-banks until the bank runs dry
+  of bars. The item dropdown is filtered live to what your Smithing level (and world membership) allows.
+- **Blast Furnace** — pick a bar. The bot runs the whole furnace cycle: it keeps the **coffer** funded
+  (typing the deposit into the chatbox prompt), pays the **foreman** every <10 minutes while Smithing is
+  under 60, feeds the **conveyor** (coal loads first for coal-bearing bars, tracked against the furnace's
+  varbit-mirrored internal stock), collects from the **bar dispenser** (Ice gloves worn if owned, a bucket
+  of water carried otherwise) and banks the bars.
 
-```gradle
-plugins {
-    id 'io.osrsx.plugin' version '0.1.0'
-}
+## Config
 
-group = 'com.example'
-version = '1.0.0'
+| Setting | Notes |
+| --- | --- |
+| Mode | `Anvil` / `Blast Furnace` |
+| Metal / Item / Location | Anvil mode. Items are level-filtered; locations come from the curated anvil-with-bank catalogue |
+| Bar | Blast Furnace mode; level-filtered |
+| Coffer deposit (gp) | How much to put in per top-up (default 100k) |
+| Wear ice gloves | Equip from the bank when owned; falls back to a bucket of water |
+| Get hammer | Withdraw (or GE-buy) a hammer before anvil work |
+| Stop at level / items / minutes | Stop targets |
 
-osrsxPlugin {
-    id = 'ping'
-    name = 'Ping'
-    description = 'Logs "pong" when started.'
-    authors = ['Your Name']
-    tags = ['utility']
-}
+## Notes & assumptions
+
+- The Blast Furnace routine assumes an **official Blast Furnace world** (the paid dwarves run the pumps;
+  the coffer funds them). Solo-running the furnace machinery on other worlds is not modelled.
+- Gold with goldsmith gauntlet swapping is not (yet) modelled — gold smelts fine wearing ice gloves.
+- Stamina potions are not (yet) used; run management is the engine's standard `manageRun()`.
+- Anvil catalogue currently ships Varrock West (the classic F2P bank-anvil pair); the catalogue is
+  structured for more sites as their gating (e.g. Prifddinas' quest lock) becomes checkable.
+
+## Dev
+
+```bash
+./gradlew build            # compile + tests
+./gradlew -t installPlugin # dev loop: rebuild + hot-reload into a running client
 ```
 
-Applying `io.osrsx.plugin` does everything else for you:
-- applies **Kotlin** + pins the **JDK-11 toolchain** the client runs on (auto-provisioned by foojay — you
-  don't need JDK 11 installed; write plain Java in `src/main/java` if you prefer),
-- wires the **osrsx SDK** repository (served anonymously over `raw.githubusercontent`, **no token**) and
-  the `compileOnly io.osrsx:osrsx-api` + `testImplementation io.osrsx:osrsx-testkit` dependencies,
-- stamps the jar manifest and **generates `plugin.yaml`** into the jar from the `osrsxPlugin { }` block —
-  that block is the single source of truth; there is no hand-written manifest to keep in sync,
-- registers the `installPlugin`, `osrsxRun`, and `publishPlugin` tasks.
-
-You can still add your own `repositories { }` / `dependencies { }` — the above is just the minimal setup.
-
-## Dev loop (edit → save → live reload)
-
-1. Launch the client once (from an osrsx checkout: `./gradlew :osrsx-core:runClient`).
-2. In this project: `./gradlew -t installPlugin` — rebuilds + reinstalls into `~/.osrsx/plugins` on every
-   save; the client's directory watcher hot-reloads it live. Enable it from the in-game Plugin Manager.
-
-Install into a specific launcher account instead: `-Posrsx.pluginsDir=~/.osrsx/homes/<account>/.osrsx/plugins`.
-
-## Publish to the registry
-
-```
-./gradlew publishPlugin
-```
-Collects the version/changelog (a small dialog, or `-PpluginVersion=`/`-Pnoninteractive`), pushes + tags
-your repo, and opens the submission issue on `osrsx/osrsx-central` (using your local `gh` token, a
-GitHub OAuth sign-in, or a token you paste). The registry CI builds + publishes it once a maintainer
-approves.
+Requires `io.osrsx:osrsx-api` **0.11.6+** (the `Keyboard` surface used for the coffer's amount prompt).
