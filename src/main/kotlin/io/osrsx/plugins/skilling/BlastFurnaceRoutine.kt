@@ -496,7 +496,12 @@ class BlastFurnaceRoutine(
         closeShop()?.let { return@section it }
         coalBagAction("Empty") // menu-inject Empty (left-click) — tips the bag's coal into the inventory
         coalBagFilled = false
-        snap(300, 700)
+        // The emptied coal lands a game tick AFTER the click, so the very next step() can read an empty-handed
+        // inventory. Mark a feed-grace so step() waits it out on the "just fed, don't bank" settle branch
+        // instead of falling through to withdrawLoad and opening the bank; once the coal registers, holdingOre
+        // outranks that branch and feedConveyor puts it on the belt.
+        lastFedMs = System.currentTimeMillis()
+        snap(500, 900)
     }
 
     // ---- Blast Furnace world -------------------------------------------------------------------------
