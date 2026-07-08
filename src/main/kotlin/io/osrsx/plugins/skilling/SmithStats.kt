@@ -59,6 +59,15 @@ class SmitherStats(private val ctx: PluginContext) {
         val e = elapsedMs()
         return if (e >= 1000) (total.toLong() * 3_600_000L / e).toInt() else 0
     }
+
+    /** GP produced this run — banked output valued at [unitPrice] gp each (the live GE guide price). */
+    fun gpValue(unitPrice: Int): Long = output().toLong() * unitPrice.toLong()
+
+    /** [gpValue] projected to an hourly rate (gp/hr); 0 until at least a second has passed. */
+    fun gpPerHour(unitPrice: Int): Long {
+        val e = elapsedMs()
+        return if (e >= 1000) gpValue(unitPrice) * 3_600_000L / e else 0
+    }
 }
 
 /**
@@ -102,9 +111,16 @@ object SmitherOverlay {
     }
 
     /** 950 -> "950", 12400 -> "12.4k", 3_500_000 -> "3.5m" (trailing ".0" dropped). */
-    fun compact(n: Int): String {
+    fun compact(n: Int): String = compact(n.toLong())
+
+    /** As [compact] but Long-wide (adds "b") — gp totals/rates can exceed Int over a long run. */
+    fun compact(n: Long): String {
         if (n < 1000) return n.toString()
-        val (value, suffix) = if (n < 1_000_000) n / 1000.0 to "k" else n / 1_000_000.0 to "m"
+        val (value, suffix) = when {
+            n < 1_000_000L -> n / 1000.0 to "k"
+            n < 1_000_000_000L -> n / 1_000_000.0 to "m"
+            else -> n / 1_000_000_000.0 to "b"
+        }
         val tenths = kotlin.math.round(value * 10).toInt()
         return if (tenths % 10 == 0) "${tenths / 10}$suffix" else "${tenths / 10}.${tenths % 10}$suffix"
     }

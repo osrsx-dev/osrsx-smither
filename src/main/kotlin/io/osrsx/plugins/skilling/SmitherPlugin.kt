@@ -116,6 +116,11 @@ class SmitherPlugin : Plugin(), HasOverlay {
                 "instead of stopping (he stocks everything except runite)",
             visibleIf = eq("mode", BF))
 
+        var hopToBfWorld by boolItem("hopToBfWorld", "Hop to Blast Furnace world", true,
+            "Before working, world-hop onto an official Blast Furnace world (the ones whose paid dwarves " +
+                "run the furnace) — hops only from a clean slate so nothing in the furnace is left behind",
+            visibleIf = eq("mode", BF))
+
         var iceGloves by boolItem("iceGloves", "Wear ice gloves", true,
             "Equip Ice gloves from the bank if you own a pair (hot bars are taken bare-handed); " +
                 "otherwise a bucket of water is carried to cool each batch",
@@ -193,6 +198,7 @@ class SmitherPlugin : Plugin(), HasOverlay {
             bar = { currentBlastBar() },
             cofferTopUp = { Config.cofferTopUp },
             buyOres = { Config.buyOres },
+            hopToBfWorld = { Config.hopToBfWorld },
             gearUp = { gearUp() },
             highlight = { Config.highlightObjects },
             stats = stats,
@@ -201,17 +207,30 @@ class SmitherPlugin : Plugin(), HasOverlay {
         )
     }
 
+    /** The chosen bar's live GE guide price, fetched ONCE at start and on a target change — not per overlay
+     *  frame. 0 until the prices cache has loaded; [barPriceOrRefresh] tops it up while it's still 0. */
+    @Volatile private var barPrice: Int = 0
+    private fun refreshBarPrice() { barPrice = ctx.prices().price(currentBlastBar().barName) }
+    /** The cached price, re-fetching only while it hasn't landed yet (prices load in the background). */
+    private fun barPriceOrRefresh(): Int {
+        if (barPrice == 0) refreshBarPrice()
+        return barPrice
+    }
+
     override fun onStart() {
         stats.start()
         stats.carried = {
             if (Config.isBlastFurnace) inventory.count(currentBlastBar().barName)
             else currentProduct()?.let { inventory.count(it.itemName(currentBar())) } ?: 0
         }
+        refreshBarPrice()
     }
 
-    /** Reset the item to "first eligible" when the metal changes — a label for the old metal is invalid. */
+    /** Reset the item to "first eligible" when the metal changes — a label for the old metal is invalid.
+     *  Re-price when the Blast Furnace bar (or mode) changes so GP/hr tracks the new target. */
     override fun onConfigChanged(key: String) {
         if (key == "bar") Config.item = ""
+        if (key == "bfBar" || key == "mode") refreshBarPrice()
     }
 
     override fun onStop() {
@@ -226,9 +245,13 @@ class SmitherPlugin : Plugin(), HasOverlay {
 
     override fun onOverlay(gui: ScriptGui) = profile("smither/overlay") {
         val rows = if (Config.isBlastFurnace) {
+            val price = barPriceOrRefresh() // cached at start / on target change, not looked up per frame
             listOf(
                 "Target" to "${currentBlastBar().display} bars — Blast Furnace",
                 "Bars banked" to SmitherOverlay.commas(stats.output()),
+                "GP made" to SmitherOverlay.compact(stats.gpValue(price)),
+                "GP/hr" to SmitherOverlay.compact(stats.gpPerHour(price)),
+                "Coffer" to SmitherOverlay.elapsed(furnace.cofferSecondsLeft() * 1000L),
             )
         } else {
             val bar = currentBar()
