@@ -173,6 +173,15 @@ class BlastFurnaceRoutine(
         // (belt/dispenser/coffer) stays on screen and clickable; the hold() above then keeps it there.
         frameCamera()
 
+        // The coal-bag Empty completes ASYNCHRONOUSLY: once the tipped coal lands in the inventory, holdingOre
+        // routes to feedConveyor (which outranks the `coalBagFilled` branch below), so emptyCoalBag never re-runs
+        // to notice its own success and clear the flag — leaving it to try to empty the now-empty bag again after
+        // the coal is fed (the "empties once, then attempts 3 more times" bug). Reconcile it here, before the
+        // routing: if an Empty was in flight and the bag's coal has now arrived, mark the load done.
+        if (emptyingBag && ctx.inventory().count("Coal") > coalAtEmptyStart) {
+            coalBagFilled = false; emptyingBag = false; emptyStartedAt = 0L
+        }
+
         val cofferLow = cofferRunningLow(coffer)
         cofferSecsLeft = cofferSecondsLeftFor(coffer) // for the overlay
         return when {
