@@ -5,6 +5,8 @@ import io.osrsx.api.PluginContext
 import io.osrsx.api.RestockSpec
 import io.osrsx.api.section
 import io.osrsx.plugin.Plugin
+import io.osrsx.plugin.Routine
+import io.osrsx.plugin.routine
 
 /**
  * The routine for ordinary anvil smithing: web-walk to the chosen catalogued [AnvilSite], bank for bars,
@@ -13,7 +15,8 @@ import io.osrsx.plugin.Plugin
  *
  * The site is chosen explicitly from [AnvilSites] (by the player or "Auto — select best"), and an anvil is
  * only clicked once we're AT that site, so the bot can't drift to a stray anvil it passes en route. Every
- * logical step is timed under a `smither/…` span via the plugin [Profiler].
+ * logical step is timed under a `smither/…` span via the plugin [Profiler]. This is a guard-less subroutine
+ * — the plugin's core routine owns the [smitherPrologue]; here the [routine]'s steps are the decision ladder.
  */
 class AnvilSmither(
     private val ctx: PluginContext,
@@ -24,42 +27,75 @@ class AnvilSmither(
     private val buyBatch: () -> Int,
     private val gearUp: () -> Long?,
     private val stats: SmitherStats,
-    lockInput: () -> Boolean,
-    stopReason: () -> String?,
 ) {
-    private val loop = SmitherLoop(ctx, lockInput, stopReason) { step() }
-
     /** Two-phase interface latch: the quantity button is clicked first, the product slot next loop. */
     private var qtyClicked = false
 
     /** Set when the bank ran dry and a GE restock is underway — drives [restock] until the loadout holds. */
     private var restocking = false
 
-    fun tick(): Long = loop.tick()
-    fun releaseInput() = loop.releaseInput()
+    /** Debounced "still hammering at the anvil" gate (was `SmitherLoop.stillWorking`). */
+    private val gate = IdleGate(ctx)
 
-    private fun step(): Long {
-        stats.status = "gearing up"
-        gearUp()?.let { return it }
-        val product = product() ?: run { stats.status = "no item chosen"; return snap(1200, 2500) }
+    /**
+     * One coherent read per tick, shared by every step (see [io.osrsx.plugin.Routine]). [gear] is sensed FIRST
+     * (before any other read), exactly as the old top-of-loop `gearUp()?.let { return it }` did, so a gearing
+     * tick never touches the rest of the game state. When the smithing interface isn't open the [qtyClicked]
+     * latch is reset here (its old `if (smithingOpen()) … else qtyClicked = false` home).
+     */
+    private data class Snap(
+        val gear: Long?,
+        val product: SmithProduct?,
+        val smithingOpen: Boolean,
+        val stillWorking: Boolean,
+    )
 
-        if (smithingOpen()) return driveInterface(product)
-        qtyClicked = false
-
+    /** The decision ladder in the SAME priority order as the old hand-rolled `step()` when-branches. */
+    val routine: Routine<*> = routine<Snap>(
+        profiler = ctx.profiler(),
+        spanPrefix = "smither",
+        status = { stats.status = it },
+        sense = {
+            val gear = gearUp()
+            if (gear != null) {
+                Snap(gear, null, false, false)
+            } else {
+                val open = smithingOpen()
+                if (!open) qtyClicked = false
+                Snap(
+                    gear = null,
+                    product = product(),
+                    smithingOpen = open,
+                    stillWorking = gate.stillBusy(IDLE_DEBOUNCE_MS),
+                )
+            }
+        },
+    ) {
+        step("gearing up", { gear != null }) { gear!! }
+        step("no item chosen", { product == null }) { stats.status = "no item chosen"; snap(1200, 2500) }
+        step("interface", { smithingOpen }) { driveInterface(product!!) }
         // Debounced idle: the anvil animation dips between hammer swings, so only a sustained idle means
         // the batch finished (avoids re-clicking the anvil mid-batch, which would reopen the interface).
-        if (loop.stillWorking()) { stats.status = "smithing"; return snap(400, 1100) }
-
+        step("smithing", { stillWorking }) { stats.status = "smithing"; snap(400, 1100) }
         // A GE restock is underway — drive the loadout (it handles the GE trip itself) BEFORE the travel
         // branch, which would otherwise fight the loadout's own walking (the bank-vs-site oscillation class).
-        if (restocking) return restock(product)
+        step("restocking", { restocking }) { restock(product!!) }
+        // Travel/smith/bank — the old "else" tail: travel FIRST while the inventory is light, then either
+        // hammer (bars in hand) or bank for a fresh load.
+        step("working", { true }) { travelSmithOrBank(product!!) }
+    }
 
-        // Travel FIRST, while the inventory is light: the web walker may need a bank detour for teleport
-        // runes en route, and a pre-withdrawn bar load leaves it no free slots for them. Bars are only
-        // withdrawn once we're AT the site — every catalogued site has a bank right beside the anvils.
-        // SITE_RADIUS is deliberately wide enough to contain the whole bank↔anvil area: inside it we never
-        // web-walk to the anchor, so heading to the site's bank can't be yanked back mid-walk (the old
-        // tight radius made banking and site-return fight each other and oscillate).
+    fun releaseInput() { if (ctx.input().isLocked()) ctx.input().unlock() }
+
+    /**
+     * Travel to the site while the inventory is light: the web walker may need a bank detour for teleport
+     * runes en route, and a pre-withdrawn bar load leaves it no free slots for them. Bars are only withdrawn
+     * once we're AT the site — every catalogued site has a bank right beside the anvils. SITE_RADIUS is
+     * deliberately wide enough to contain the whole bank↔anvil area: inside it we never web-walk to the
+     * anchor, so heading to the site's bank can't be yanked back mid-walk (the old tight radius made banking
+     * and site-return fight each other and oscillate).
+     */
+    private fun travelSmithOrBank(product: SmithProduct): Long {
         val target = site() ?: run { stats.status = "no location"; return snap(1200, 2500) }
         val me = ctx.players().localPlayer()?.tile()
         if (me == null || me.distanceTo(target.tile) > SITE_RADIUS) {
@@ -67,7 +103,6 @@ class AnvilSmither(
             ctx.webWalking().walkTo(target.tile)
             return snap(300, 1100)
         }
-
         return if (ctx.inventory().count(bar().barName) >= product.bars) smith() else bankBars(product)
     }
 
@@ -89,7 +124,7 @@ class AnvilSmither(
      *  we're at the bank edge of a larger site), close in on the anchor locally. */
     private fun smith(): Long = ctx.profiler().section("smither/anvil") {
         val anvil = ctx.objects().query().named("Anvil").withAction("Smith").nearest()
-        if (anvil != null && anvil.distance() <= INTERACT_RANGE && loop.canReach(anvil)) {
+        if (anvil != null && anvil.distance() <= INTERACT_RANGE && ctx.canReach(anvil)) {
             stats.status = "smithing"
             if (!anvil.leftClickIfDefault("Smith")) anvil.interact("Smith")
             return@section snap(600, 1400)
@@ -164,5 +199,9 @@ class AnvilSmither(
 
         /** Bars per bank load — a full inventory less the hammer's slot. */
         const val FULL_LOAD = 27
+
+        /** How long the idle animation must persist before we treat the batch as actually stopped — the
+         *  anvil animation's between-swing dip is well under this (was `SmitherLoop.IDLE_DEBOUNCE_MS`). */
+        const val IDLE_DEBOUNCE_MS = 2200L
     }
 }
