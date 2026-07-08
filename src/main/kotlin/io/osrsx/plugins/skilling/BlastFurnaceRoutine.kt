@@ -79,9 +79,9 @@ class BlastFurnaceRoutine(
     /** When the bank first reported open — so counts wait for its items to populate before being trusted. */
     private var bankOpenedAt = 0L
 
-    /** Coal-bag state: whether the account owns one (decided once the bank is seen), and whether the bag is
-     *  currently filled. The bag is NEVER emptied by hand — the furnace conveyor drains a filled bag onto the
-     *  belt when loose coal is put on — so coalBagFilled only guards against re-Filling an already-full bag. */
+    /** Coal-bag state: whether the account owns one (decided once the bank is seen), and whether the bag
+     *  currently holds a load waiting to be emptied onto the belt (its second coal load). The bag ~doubles
+     *  coal per bank trip. Emptied only AT THE BELT after the loose coal is fed, never at the bank. */
     private var coalBagChecked = false
     private var ownsCoalBag = false
     private var coalBagFilled = false
@@ -149,9 +149,11 @@ class BlastFurnaceRoutine(
             held > 0 -> bankBars(bar)
             // The bank ran dry and we're restocking from Ordan's ore store — finish that before feeding.
             buyingOre != null -> buyOre()
-            // Ore in hand → feed the conveyor (one click deposits the whole inventory of ore, and the furnace
-            // empties any filled coal bag onto the belt along with it — so there is no separate empty step).
+            // Ore in hand → feed the conveyor (one click deposits the whole inventory of ore).
             holdingOre(bar) -> feedConveyor(bar)
+            // Loose coal fed, but the coal bag still holds a load → tip it into the inventory AT THE BELT, then
+            // it feeds on the next tick (the bag's whole point: a second coal load with no extra bank trip).
+            coalBagFilled -> emptyCoalBag()
             // Just fed the target ore → go STRAIGHT to the bar dispenser (walk-to-interact lands as "Take"
             // opens); never bank a fresh load in the varbit-lag gap and backtrack.
             awaitingCollect -> collect(bar)
@@ -276,9 +278,8 @@ class BlastFurnaceRoutine(
         // A landed click is in flight: the avatar walks to the belt and unloads. Only re-click once the
         // retry window passes with the ore still in hand (the click missed / was eaten).
         if (feeding) {
-            if (ore < oreAtFeed) { // unloaded — the conveyor took the load (and empties a filled coal bag with it)
+            if (ore < oreAtFeed) { // unloaded — done
                 feeding = false; lastFedMs = System.currentTimeMillis()
-                coalBagFilled = false // the Blast Furnace conveyor auto-empties a filled coal bag onto the belt
                 if (fedPrimaryOre) awaitingCollect = true // fed the target ore → the dispenser is next, not the bank
                 return@section snap(250, 700)
             }
@@ -381,18 +382,18 @@ class BlastFurnaceRoutine(
             return@section Plugin.NO_LOOP
         }
 
-        // Coal bag: Fill the bag from the bank, then Withdraw-All the loose coal — both in ONE bank visit, and
-        // we NEVER empty the bag ourselves. At the Blast Furnace the conveyor empties a filled coal bag onto
-        // the belt automatically when the loose coal is put on, so a single "Put-ore-on" deposits bag + loose
-        // coal together (~2× coal per bank trip) with no manual Empty step. `coalBagFilled` tracks "bag is
-        // currently full" so we don't re-Fill an already-full bag — a full bag has no Fill row, and the
-        // menu-swap would then fall through to banking it; it is reset in feedConveyor once the belt drains it.
+        // Coal bag: in ONE bank visit Fill the bag from the bank AND Withdraw-All the loose coal, so we leave
+        // HOLDING a loose load with the bag also full. Doing both in the same visit is what keeps the Empty OUT
+        // of the bank: we leave holding loose coal, so step()'s `holdingOre -> feedConveyor` outranks
+        // `coalBagFilled -> emptyCoalBag` and the belt feeds the loose coal FIRST; only once that's gone does
+        // [emptyCoalBag] tip the bag's second load in AT THE BELT. (Filling then returning before the
+        // withdraw-all left us holding nothing, so emptyCoalBag fired at the bank and dumped the fresh coal.)
         if (wantCoal && ownsCoalBag) {
             // The bag must be in the inventory before it can be filled — withdraw it on its own tick first.
             if (ctx.inventory().count(COAL_BAG) == 0) { bank.withdraw(COAL_BAG, 1); return@section snap(300, 700) }
-            if (!coalBagFilled) coalBagAction("Fill") // menu-inject Fill → the empty bag loads up from the bank
-            coalBagFilled = true
-            withdrawAllInjected(bank, "Coal")         // then one left-click Withdraw-All fills the free slots
+            coalBagAction("Fill")             // menu-inject Fill → the bag loads up from the bank
+            withdrawAllInjected(bank, "Coal") // then one left-click Withdraw-All fills the remaining free slots
+            coalBagFilled = true              // hold loose coal now, so step() feeds it BEFORE emptying the bag
             bank.close()
             return@section snap(400, 1000)
         }
@@ -484,6 +485,18 @@ class BlastFurnaceRoutine(
         ctx.camera().zoom(-FULL_ZOOM_NOTCHES, 800) // negative = zoom OUT; wait a beat for the mouse lock
         ctx.camera().rotateToPitch(OVERHEAD_PITCH) // coerced to the client's max (most top-down)
         cameraFramed = true
+    }
+
+    /** After the first (loose) coal load is on the belt, tip the coal bag's stored load into the inventory so
+     *  the next tick feeds it too — a second coal load per bank trip. NOT done at the bank (that dumped the
+     *  coal we'd just withdrawn); only here, once the loose coal has already gone onto the belt. */
+    private fun emptyCoalBag(): Long = ctx.profiler().section("smither/bf-coalbag") {
+        stats.status = "emptying coal bag"
+        closeBankIfOpen()?.let { return@section it }
+        closeShop()?.let { return@section it }
+        coalBagAction("Empty") // menu-inject Empty (left-click) — tips the bag's coal into the inventory
+        coalBagFilled = false
+        snap(300, 700)
     }
 
     // ---- Blast Furnace world -------------------------------------------------------------------------
