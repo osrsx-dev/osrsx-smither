@@ -3,6 +3,7 @@ package io.osrsx.plugins.skilling
 import io.osrsx.api.PluginContext
 import io.osrsx.api.Skill
 import io.osrsx.api.Tile
+import io.osrsx.api.WorldInfo
 
 /**
  * The static Smithing catalogue the [SmitherPlugin] is driven by, plus the live account checks that decide
@@ -100,6 +101,24 @@ enum class SmithProduct(
 
         fun optionsFor(bar: BarType, ctx: PluginContext): List<String> = eligible(bar, ctx).map { it.display }
     }
+}
+
+/**
+ * Official Blast Furnace world selection. Only these worlds run the paid dwarves that the coffer funds;
+ * RuneLite tags them `activity = "Blast Furnace"` (see [WorldInfo.activity]). Pure functions over a world
+ * list so the routine's hop decision is unit-testable headlessly.
+ */
+object BfWorlds {
+    const val ACTIVITY = "Blast Furnace"
+
+    /** Is [worldId] an official Blast Furnace world within [worlds]? */
+    fun isOn(worlds: List<WorldInfo>, worldId: Int): Boolean =
+        worlds.firstOrNull { it.id == worldId }?.isActivity(ACTIVITY) == true
+
+    /** The least-populated official Blast Furnace world other than [current], or null if none are listed. */
+    fun pick(worlds: List<WorldInfo>, current: Int): Int? =
+        worlds.filter { it.id != current && it.normal && it.isActivity(ACTIVITY) }
+            .minByOrNull { it.players }?.id
 }
 
 /** True/false when the current world's membership is known, null while the world list is still loading. */
