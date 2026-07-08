@@ -104,6 +104,14 @@ class BlastFurnaceRoutine(
     private var fillClickedAt = 0L
     private var fillAttempts = 0
     private var bankCoalAtFill = -1
+    /** Clean-start guard: the first time the coal bag is used in a run it's emptied into the OPEN bank so any
+     *  leftover coal (a prior run, or a belt-empty that gave up) can't skew the fill/empty deltas or leave the
+     *  bag "already full". Confirmed by the bank's coal RISING (one Empty tips the whole bag); assumed already
+     *  empty after a few no-deposit clicks. Reset whenever the bag is re-acquired from the bank. */
+    private var coalBagClearedForStart = false
+    private var clearClickedAt = 0L
+    private var clearAttempts = 0
+    private var bankCoalAtClear = -1
 
     /** Set once we've tilted the camera overhead for the furnace — done a single time, then held frozen. */
     private var cameraFramed = false
@@ -436,7 +444,34 @@ class BlastFurnaceRoutine(
         // withdraw-all left us holding nothing, so emptyCoalBag fired at the bank and dumped the fresh coal.)
         if (wantCoal && ownsCoalBag) {
             // The bag must be in the inventory before it can be filled — withdraw it on its own tick first.
-            if (ctx.inventory().count(COAL_BAG) == 0) { bank.withdraw(COAL_BAG, 1); return@section snap(300, 700) }
+            // Re-acquiring it arms the clean-start clear below.
+            if (ctx.inventory().count(COAL_BAG) == 0) {
+                bank.withdraw(COAL_BAG, 1); coalBagClearedForStart = false; return@section snap(300, 700)
+            }
+            // Clean starting state: empty the coal bag into the OPEN bank BEFORE the first fill of the run, so
+            // leftover coal (a prior run, or a belt-empty that gave up) can't skew the fill/empty coal-count
+            // deltas or leave the bag "already full". With the bank open, Empty deposits the WHOLE bag back into
+            // the bank; confirm by the bank's coal rising, and assume the bag was already empty after a few
+            // no-deposit clicks. Only once per acquisition — the belt-empty leaves the bag empty each cycle after.
+            if (!coalBagClearedForStart) {
+                val bankCoalC = ctx.bank().count("Coal")
+                when {
+                    bankCoalAtClear >= 0 && bankCoalC > bankCoalAtClear -> { // deposited → bag emptied → clean
+                        coalBagClearedForStart = true; bankCoalAtClear = -1; clearAttempts = 0
+                    }
+                    bankCoalAtClear >= 0 && System.currentTimeMillis() - clearClickedAt < ACTION_RETRY_MS ->
+                        return@section snap(300, 700) // an Empty click is in flight → wait for the deposit
+                    clearAttempts >= COALBAG_CLEAR_MAX_ATTEMPTS -> { // no deposit after retries → already empty
+                        coalBagClearedForStart = true; bankCoalAtClear = -1; clearAttempts = 0
+                    }
+                    else -> {
+                        bankCoalAtClear = bankCoalC
+                        coalBagAction("Empty") // bank open → deposits the bag's coal back into the bank
+                        clearClickedAt = System.currentTimeMillis(); clearAttempts++
+                        return@section snap(300, 700)
+                    }
+                }
+            }
             // Fill the bag, CONFIRMED by the bank's coal stack dropping (the bag pulls up to 27 out of the bank).
             // A missed Fill leaves an empty bag that yields no second coal load at the belt, under-feeding the
             // furnace and skewing its coal:ore ratio — so retry the click until the delta shows it took. If
@@ -761,6 +796,9 @@ class BlastFurnaceRoutine(
         /** No-drop Fill clicks (bank coal unchanged) after which the bag is assumed already full — a no-op Fill
          *  can't move the bank stack, so repeated no-drops mean the bag had coal from a prior deferred load. */
         const val COALBAG_FILL_MAX_ATTEMPTS = 3
+        /** No-deposit Empty clicks (bank coal unchanged) after which the bag is assumed already empty on the
+         *  clean-start clear — one landed Empty tips the whole bag, so repeated no-deposits mean it was empty. */
+        const val COALBAG_CLEAR_MAX_ATTEMPTS = 3
         /** After a load lands on the belt, wait at least this long for the furnace's varbits to register it
          *  before treating the furnace as idle (they lag ~a tick) — stops a premature bank trip + backtrack. */
         const val FURNACE_SETTLE_MS = 1800L
