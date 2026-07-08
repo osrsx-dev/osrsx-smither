@@ -699,6 +699,11 @@ class BlastFurnaceRoutine(
      *  still loading; logs and stays put if none are listed, so a data hiccup can't strand the run. */
     private fun hopToBlastFurnace(): Long {
         stats.status = "finding Blast Furnace world"
+        // A world hop won't go through with the bank (or shop) interface open — it wedges. Close it FIRST and
+        // hop on the next tick with a clear screen. (Gear-up opens the bank for Graceful/gloves, and bankBars
+        // now leaves it open for the following withdraw, so a hop can arrive with the bank still up.)
+        closeBankIfOpen()?.let { return it }
+        closeShop()?.let { return it }
         val worlds = ctx.worlds()
         val all = worlds.list()
         if (all.isEmpty()) return snap(600, 1200) // list not fetched yet
