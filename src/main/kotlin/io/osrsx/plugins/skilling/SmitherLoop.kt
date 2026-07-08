@@ -28,6 +28,9 @@ class SmitherLoop(
     private val lockInput: () -> Boolean,
     private val stopReason: () -> String?,
     private val autoDialogue: Boolean = true,
+    /** Runs once per actively-working tick (see [tick]) — a routine uses it to refresh a per-loop lease it must
+     *  keep alive even on the ticks that skip [step] (e.g. the Blast Furnace's camera hold). Default no-op. */
+    private val onTick: () -> Unit = {},
     private val step: () -> Long,
 ) {
     private val breaks: BreakManager? get() = ctx.services().get<BreakManager>()
@@ -42,6 +45,10 @@ class SmitherLoop(
         applyInputLock()
         breaks?.let { if (it.onBreak()) return@section Rng.uniform(2000, 5000) }
         ctx.walking().manageRun()
+        // Per-tick hook — placed AFTER the login/yield/stop/break early-returns (so we don't hold a lease while
+        // idle for a long break) but BEFORE the antiban-idle branch below, which returns without a step: that
+        // branch is exactly why a lease refreshed only inside step() lapses mid-run.
+        onTick()
         if (autoDialogue && ctx.dialogues().canContinue()) {
             ctx.dialogues().continueAuto(); return@section Rng.uniform(600, 1000)
         }

@@ -1,6 +1,7 @@
 package io.osrsx.plugins.skilling
 
 import io.osrsx.api.BankingService
+import io.osrsx.api.CameraAction
 import io.osrsx.api.HIGHLIGHT_FOREVER
 import io.osrsx.api.Highlight
 import io.osrsx.api.HighlightStyle
@@ -46,7 +47,7 @@ class BlastFurnaceRoutine(
     lockInput: () -> Boolean,
     stopReason: () -> String?,
 ) {
-    private val loop = SmitherLoop(ctx, lockInput, stopReason) { step() }
+    private val loop = SmitherLoop(ctx, lockInput, stopReason, onTick = { holdCamera() }) { step() }
     private val log = PluginLog("smither")
 
     /** When we last paid the foreman (0 = never this run) — repaid a little before the 10 min lapses. */
@@ -96,6 +97,11 @@ class BlastFurnaceRoutine(
 
     /** Set once we've tilted the camera overhead for the furnace — done a single time, then held frozen. */
     private var cameraFramed = false
+    /** Idle-mouse humanizer parking. Blocking only ZOOM/PITCH (below) is NOT a full camera hold, so the
+     *  idle-mouse humanizer keeps running unless told otherwise — park it explicitly so it can't fidget the
+     *  cursor off the belt mid-click, and restore its prior state on stop. */
+    private var idleMouseParked = false
+    private var idleMouseWasOn = true
 
     /** The single live target highlight — re-pointed as the current object changes (so they don't stack). */
     private var targetHl: Highlight? = null
@@ -105,16 +111,26 @@ class BlastFurnaceRoutine(
     fun releaseInput() {
         loop.releaseInput()
         clearMark()
-        ctx.cameraControl().release() // let the humanizers resume once we stop
+        ctx.cameraControl().release() // let the camera humanizer resume once we stop
+        if (idleMouseParked) { ctx.humanizers().setIdleMouse(idleMouseWasOn); idleMouseParked = false }
         cameraFramed = false
     }
 
+    /** Refreshed on EVERY loop tick via [SmitherLoop]'s onTick hook — INCLUDING the antiban-idle ticks that
+     *  return without running a [step] — so the camera lease can't lapse mid-run and let the humanizer snap
+     *  back to its own framing (the "camera reverts" bug from refreshing only inside step()). Blocks just
+     *  ZOOM + PITCH so the fixed overhead framing holds while yaw (rotate) stays free for a natural look;
+     *  separately parks the idle-mouse humanizer (a partial block wouldn't stand it down). */
+    private fun holdCamera() {
+        if (!idleMouseParked) { idleMouseWasOn = ctx.humanizers().setIdleMouse(false); idleMouseParked = true }
+        ctx.cameraControl().block(setOf(CameraAction.ZOOM, CameraAction.PITCH), CAMERA_HOLD_TTL_MS)
+    }
+
     private fun step(): Long {
-        // Freeze the background camera AND idle-mouse humanizers for the whole run: the furnace is a cramped
-        // room and an auto-rotate/zoom/fidget mid-click loses the belt (the "viewport too short" misses).
-        // hold() blocks every CameraAction, which CameraDirector reports as suspended() — the one signal both
-        // the CameraHumanizer and the IdleMouseHumanizer stand down on. Refreshed each loop (5s lease TTL).
-        ctx.cameraControl().hold()
+        // The camera + idle-mouse humanizers are parked for the whole run from the loop's per-tick hook
+        // ([holdCamera], wired into SmitherLoop.onTick), so the lease refreshes on every tick and can't lapse
+        // mid-run. We block only ZOOM + PITCH to hold the overhead framing (the cramped room needs objects to
+        // stay on-screen) while leaving yaw free, so the camera can rotate naturally as we work.
 
         stats.status = "gearing up"
         gearUp()?.let { return it }
@@ -325,9 +341,12 @@ class BlastFurnaceRoutine(
     private fun collect(bar: BlastBar): Long = ctx.profiler().section("smither/bf-collect") {
         stats.status = "collecting bars"
         closeBankIfOpen()?.let { return@section it }
-        // The Take opens the skill-multi "How many?" interface — collect the lot.
+        // The Take opens the skill-multi "How many?" interface. Two quick Spaces clear it: the first selects
+        // the default ("all") quantity and starts the take, the second dismisses the follow-up continue prompt
+        // — faster and simpler than clicking the All button and then the continue dialog separately.
         if (ctx.dialogues().makeOpen()) {
-            ctx.dialogues().makeQuantity(all = true)
+            ctx.keyboard().pressSpace()
+            ctx.keyboard().pressSpace()
             taking = false
             return@section snap(900, 1700)
         }
@@ -682,6 +701,10 @@ class BlastFurnaceRoutine(
         const val PRIMARY_LOAD = 26
 
         const val ACTION_RETRY_MS = 3500L
+        /** Camera-lease TTL for the per-tick [holdCamera] refresh — comfortably longer than the loop's longest
+         *  single delay (the ~4s antiban idle) so a per-tick refresh keeps the furnace framing frozen; a clean
+         *  stop drops it immediately via release(), so only a hard crash waits this out. */
+        const val CAMERA_HOLD_TTL_MS = 8_000L
         /** Hold a menu-swap this long before/around the click so the injected default lands on the live menu. */
         const val SWAP_SETTLE_MS = 150L
         /** Total time to keep retrying the coal-bag Empty (≈3 clicks) before giving up on the load — long
