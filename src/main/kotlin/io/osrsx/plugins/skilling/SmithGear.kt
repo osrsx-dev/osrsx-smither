@@ -51,7 +51,10 @@ class SmithGear(
 
         val hasHammer = !wantHammer() || invNames.any { it in HAMMERS }
         val glovesDone = !wantIceGloves() || wearablesChecked || ICE_GLOVES in equipIds
-        val gracefulDone = !wantGraceful() || wearablesChecked || GRACEFUL_PIECES.all { it in equipNames }
+        // Ice gloves own the hands slot when worn, so the Graceful GLOVES are dropped from the target set —
+        // never equip both / never fight the ice gloves for the slot.
+        val gracefulTargets = if (wantIceGloves()) GRACEFUL_PIECES.filter { it != GRACEFUL_GLOVES } else GRACEFUL_PIECES
+        val gracefulDone = !wantGraceful() || wearablesChecked || gracefulTargets.all { it in equipNames }
 
         if (hasHammer && glovesDone && gracefulDone) { gearUnmetStreak = 0; return@section null }
 
@@ -75,7 +78,7 @@ class SmithGear(
         fun ownedName(name: String) = name in invNames || name in equipNames || name in bankNames
 
         val ownGloves = owned(ICE_GLOVES)
-        val ownedGraceful = if (wantGraceful()) GRACEFUL_PIECES.filter { ownedName(it) && it !in equipNames } else emptyList()
+        val ownedGraceful = if (wantGraceful()) gracefulTargets.filter { ownedName(it) && it !in equipNames } else emptyList()
         val ownCoalBag = ownedName(COAL_BAG)
 
         // ONE loadout describes the whole required set. apply() reconciles: withdraw/equip the deficits, and
@@ -121,8 +124,9 @@ class SmithGear(
 
         /** Graceful (agility) outfit pieces, matched by NAME so any recolour (Ardougne, Kourend, …) counts.
          *  Worn if the account already owns them — purely cosmetic, never bought. */
+        const val GRACEFUL_GLOVES = "Graceful gloves"
         val GRACEFUL_PIECES = listOf(
-            "Graceful hood", "Graceful top", "Graceful legs", "Graceful cape", "Graceful gloves", "Graceful boots",
+            "Graceful hood", "Graceful top", "Graceful legs", "Graceful cape", GRACEFUL_GLOVES, "Graceful boots",
         )
     }
 }
