@@ -107,6 +107,40 @@ class SmithingItemsTest {
     }
 
     @Test
+    fun `blast furnace world is identified by its activity and picked by lowest population`() {
+        fun w(id: Int, players: Int, activity: String = "", types: Set<String> = emptySet()) =
+            WorldInfo(id, players, 0, true, false, false, types, activity)
+
+        val worlds = listOf(
+            w(301, 500),                                    // plain world, no activity
+            w(352, 800, "Blast Furnace"),                   // official BF, busy
+            w(355, 120, "Blast Furnace"),                   // official BF, quietest
+            w(358, 60, "Blast Furnace", setOf("HIGH_RISK")),// BF but restricted — excluded by `normal`
+            w(360, 90, "Wintertodt"),                       // different activity
+        )
+
+        assertTrue(BfWorlds.isOn(worlds, 352))
+        assertFalse(BfWorlds.isOn(worlds, 301))
+        // Picks the least-populated NORMAL Blast Furnace world, never the current one or the high-risk one.
+        assertEquals(355, BfWorlds.pick(worlds, current = 301))
+        assertEquals(355, BfWorlds.pick(worlds, current = 352))
+        // Already on the quietest BF world → the only other normal BF world (352) is the next best.
+        assertEquals(352, BfWorlds.pick(worlds, current = 355))
+        // Nothing to hop to when the list holds no eligible BF world.
+        assertEquals(null, BfWorlds.pick(worlds.filter { it.id == 358 }, current = 301))
+        assertEquals(null, BfWorlds.pick(emptyList(), current = 301))
+    }
+
+    @Test
+    fun `WorldInfo activity match is case-insensitive and defaults empty`() {
+        val bf = WorldInfo(352, 100, 0, true, false, false, emptySet(), "Blast Furnace")
+        assertTrue(bf.isActivity("blast furnace"))
+        assertFalse(bf.isActivity("Wintertodt"))
+        // The trailing default keeps older positional constructors valid.
+        assertFalse(WorldInfo(301, 100, 0, false, false, false, emptySet()).isActivity("Blast Furnace"))
+    }
+
+    @Test
     fun `anvil sites resolve BEST and a specific label`() {
         val ctx = ctx(members = false, smithing = 40)
         assertEquals(AnvilSites.BEST, AnvilSites.optionsFor(ctx).last(), "BEST is always the last option")
