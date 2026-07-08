@@ -375,21 +375,20 @@ class BlastFurnaceRoutine(
             return@section Plugin.NO_LOOP
         }
 
-        // Coal bag: Fill the bag from the bank, then Withdraw-All the loose coal. The bag holds 27 and a
-        // full inventory (the bag takes one slot) is also 27 — so bag + loose = 54 = exactly one 27-bar run
-        // for a 2-coal bar like Mithril. We leave holding the loose coal, so the belt feeds it, then
-        // [emptyCoalBag] tips the bag's load in after.
+        // Coal bag: in ONE bank visit, Fill the bag from the bank AND Withdraw-All the loose coal, so we
+        // leave HOLDING a loose load with the bag also full. The bag holds 27 and the free inventory slots
+        // hold ~26 more — so bag + loose ≈ one extra run's worth, ~doubling coal per bank trip. Doing both in
+        // the same tick is critical: it leaves us holding loose coal, so step()'s `holdingOre -> feedConveyor`
+        // wins over `coalBagFilled -> emptyCoalBag` and the belt feeds the loose coal FIRST; only once that
+        // load is gone does [emptyCoalBag] tip the bag's second load in. Filling and returning WITHOUT the
+        // withdraw-all left us holding nothing, so emptyCoalBag fired immediately and dumped the bag we'd
+        // just filled (the "fills the bag then empties it straight back" bug).
         if (wantCoal && ownsCoalBag) {
-            // Withdraw the bag, then CLOSE the bank — the "Fill" menu-swap only takes on a FRESHLY reopened
-            // bank, not the same session the bag was just withdrawn in (there the left-click stays "Deposit"
-            // and banks the bag: the flip-flop). ensureBankOpen reopens it next tick, then we Fill.
+            // The bag must be in the inventory before it can be filled — withdraw it on its own tick first.
             if (ctx.inventory().count(COAL_BAG) == 0) { bank.withdraw(COAL_BAG, 1); return@section snap(300, 700) }
-            if (!coalBagFilled) {
-                coalBagAction("Fill") // menu-inject Fill (empty bag → fills; a FULL bag has no Fill row and gets
-                coalBagFilled = true  // banked — the count==0 branch above re-withdraws it, already loaded)
-                return@section snap(400, 800)
-            }
-            withdrawAllInjected(bank, "Coal") // menu-inject "Withdraw-All" → one left-click fills the free slots
+            coalBagAction("Fill")             // menu-inject Fill → the bag loads up from the bank
+            withdrawAllInjected(bank, "Coal") // then one left-click Withdraw-All fills the remaining free slots
+            coalBagFilled = true              // hold loose coal now, so step() feeds it before emptying the bag
             bank.close()
             return@section snap(400, 1000)
         }
@@ -489,7 +488,7 @@ class BlastFurnaceRoutine(
         stats.status = "emptying coal bag"
         closeBankIfOpen()?.let { return@section it }
         closeShop()?.let { return@section it }
-        coalBagAction("Empty") // right-click Empty — tips the bag out onto the belt
+        coalBagAction("Empty") // menu-inject Empty (left-click) — tips the bag's coal into the inventory
         coalBagFilled = false
         snap(300, 700)
     }
