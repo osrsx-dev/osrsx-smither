@@ -94,6 +94,16 @@ class BlastFurnaceRoutine(
     private var emptyingBag = false
     private var emptyClickedAt = 0L
     private var emptyStartedAt = 0L
+    /** Inventory coal count when the current Empty began — the delta baseline. The Empty is CONFIRMED only once
+     *  the inventory coal rises above it (the bag genuinely tipped its load in), never on a bare click. */
+    private var coalAtEmptyStart = 0
+    /** Fill confirmation via coal-count delta: a Fill is CONFIRMED once the BANK's coal stack drops (the bag
+     *  pulled coal out of it). A missed Fill leaves an empty bag that later yields nothing at the belt — under-
+     *  feeding a coal load and skewing the furnace's coal:ore ratio (the 81-coal-to-27-ore desync). Retried
+     *  until the delta shows, or until [COALBAG_FILL_MAX_ATTEMPTS] no-drop clicks imply the bag is already full. */
+    private var fillClickedAt = 0L
+    private var fillAttempts = 0
+    private var bankCoalAtFill = -1
 
     /** Set once we've tilted the camera overhead for the furnace — done a single time, then held frozen. */
     private var cameraFramed = false
@@ -418,9 +428,35 @@ class BlastFurnaceRoutine(
         if (wantCoal && ownsCoalBag) {
             // The bag must be in the inventory before it can be filled — withdraw it on its own tick first.
             if (ctx.inventory().count(COAL_BAG) == 0) { bank.withdraw(COAL_BAG, 1); return@section snap(300, 700) }
-            coalBagAction("Fill")             // menu-inject Fill → the bag loads up from the bank
-            withdrawAllInjected(bank, "Coal") // then one left-click Withdraw-All fills the remaining free slots
-            coalBagFilled = true              // hold loose coal now, so step() feeds it BEFORE emptying the bag
+            // Fill the bag, CONFIRMED by the bank's coal stack dropping (the bag pulls up to 27 out of the bank).
+            // A missed Fill leaves an empty bag that yields no second coal load at the belt, under-feeding the
+            // furnace and skewing its coal:ore ratio — so retry the click until the delta shows it took. If
+            // enough clicks move no bank coal, the bag was already full (a no-op Fill can't move the stack), so
+            // treat it as filled rather than loop. coalBagFilled doubles as the "bag is loaded, empty it at the
+            // belt" flag, so it is only set once the bag genuinely holds coal.
+            if (!coalBagFilled) {
+                val bankCoal = ctx.bank().count("Coal")
+                when {
+                    bankCoalAtFill >= 0 && bankCoal < bankCoalAtFill -> { // confirmed: the bag absorbed coal
+                        coalBagFilled = true; bankCoalAtFill = -1; fillAttempts = 0
+                    }
+                    bankCoalAtFill >= 0 && System.currentTimeMillis() - fillClickedAt < ACTION_RETRY_MS ->
+                        return@section snap(300, 700) // a Fill click is in flight → wait for the bank delta
+                    fillAttempts >= COALBAG_FILL_MAX_ATTEMPTS -> { // no drop after retries → bag already full
+                        log.i("coal bag already full — proceeding")
+                        coalBagFilled = true; bankCoalAtFill = -1; fillAttempts = 0
+                    }
+                    else -> {
+                        bankCoalAtFill = bankCoal
+                        coalBagAction("Fill") // menu-inject Fill → the bag loads up from the bank
+                        fillClickedAt = System.currentTimeMillis(); fillAttempts++
+                        return@section snap(300, 700)
+                    }
+                }
+            }
+            // Bag confirmed loaded → top up the free slots with loose coal and leave HOLDING it, so step() feeds
+            // the loose coal FIRST and only then [emptyCoalBag] tips the bag's second load in at the belt.
+            withdrawAllInjected(bank, "Coal")
             bank.close()
             return@section snap(400, 1000)
         }
@@ -522,30 +558,32 @@ class BlastFurnaceRoutine(
         closeBankIfOpen()?.let { return@section it }
         closeShop()?.let { return@section it }
 
-        // SUCCESS: the Empty landed and the bag's coal is now in the inventory. Only here is it safe to clear
-        // the filled flag — the emptied coal lands a game tick after the click, so mark a feed-grace so step()
-        // waits on the "just fed, don't bank" settle branch; once the coal registers, holdingOre outranks the
+        val coalNow = ctx.inventory().count("Coal")
+        // SUCCESS: the inventory coal has RISEN since we began emptying → the bag tipped its load in. Delta-
+        // based (not a bare "> 0"), so it holds even if a stray coal was already in hand. Only here is it safe
+        // to clear the loaded flag — the emptied coal lands a game tick after the click, so mark a feed-grace so
+        // step() waits on the "just fed, don't bank" settle branch; once it registers, holdingOre outranks the
         // coalBagFilled branch and feedConveyor puts this second load on the belt.
-        if (ctx.inventory().count("Coal") > 0) {
+        if (emptyStartedAt != 0L && coalNow > coalAtEmptyStart) {
             coalBagFilled = false; emptyingBag = false; emptyStartedAt = 0L
             lastFedMs = System.currentTimeMillis()
             return@section snap(250, 700)
         }
-        // A click is in flight → wait for the coal to appear before re-clicking. The menu-swap can miss when
-        // the injected "Empty" default hasn't settled onto the live menu yet (a plain left-click then fires the
-        // bag's real default, doing nothing) — the misclick that used to clear coalBagFilled with the load still
-        // trapped in the bag and send us back to the bank. Retry until the coal actually drops.
+        // First entry this cycle → capture the delta baseline before the first click.
+        if (emptyStartedAt == 0L) { coalAtEmptyStart = coalNow; emptyStartedAt = System.currentTimeMillis() }
+        // A click is in flight → wait for the coal to land before re-clicking. The menu-swap Empty can miss when
+        // the injected default hasn't settled onto the live menu yet (a plain left-click then fires the bag's
+        // real default, doing nothing). Because the Fill was delta-confirmed, we KNOW the bag holds coal, so we
+        // keep re-clicking until it actually comes out instead of giving up early and skewing the coal:ore ratio.
         if (emptyingBag && System.currentTimeMillis() - emptyClickedAt < ACTION_RETRY_MS) return@section snap(400, 900)
-
-        // Give up after a bounded window: if the coal never appears the bag was probably never actually filled
-        // (a missed Fill set the flag), so clear it and let the normal cycle re-bank rather than loop forever.
-        if (emptyStartedAt != 0L && System.currentTimeMillis() - emptyStartedAt > COALBAG_EMPTY_DEADLINE_MS) {
-            log.w("coal bag never emptied after retries — dropping this load and re-banking")
+        // Final safety net: if after a long window the coal STILL hasn't appeared, drop the flag and re-bank so a
+        // genuinely stuck bag can't wedge the run. The delta-confirmed Fill makes this path rare, and a re-bank
+        // finds the bag already full and re-empties it, so the load isn't lost — just deferred a trip.
+        if (System.currentTimeMillis() - emptyStartedAt > COALBAG_EMPTY_DEADLINE_MS) {
+            log.w("coal bag never emptied after retries — dropping this load and re-banking to resync")
             coalBagFilled = false; emptyingBag = false; emptyStartedAt = 0L
             return@section snap(300, 700)
         }
-
-        if (emptyStartedAt == 0L) emptyStartedAt = System.currentTimeMillis()
         coalBagAction("Empty") // menu-inject Empty (left-click) — tips the bag's coal into the inventory
         emptyingBag = true; emptyClickedAt = System.currentTimeMillis()
         snap(500, 900)
@@ -707,9 +745,13 @@ class BlastFurnaceRoutine(
         const val CAMERA_HOLD_TTL_MS = 8_000L
         /** Hold a menu-swap this long before/around the click so the injected default lands on the live menu. */
         const val SWAP_SETTLE_MS = 150L
-        /** Total time to keep retrying the coal-bag Empty (≈3 clicks) before giving up on the load — long
-         *  enough to ride out a settled-late menu-swap, short enough not to stall if the bag was never filled. */
-        const val COALBAG_EMPTY_DEADLINE_MS = 11_000L
+        /** Total time to keep retrying the coal-bag Empty before giving up on the load. Generous (≈4 clicks)
+         *  because the delta-confirmed Fill means the bag really does hold coal, so a missed Empty is worth
+         *  retrying rather than skewing the coal:ore ratio; only a genuinely stuck bag hits this. */
+        const val COALBAG_EMPTY_DEADLINE_MS = 15_000L
+        /** No-drop Fill clicks (bank coal unchanged) after which the bag is assumed already full — a no-op Fill
+         *  can't move the bank stack, so repeated no-drops mean the bag had coal from a prior deferred load. */
+        const val COALBAG_FILL_MAX_ATTEMPTS = 3
         /** After a load lands on the belt, wait at least this long for the furnace's varbits to register it
          *  before treating the furnace as idle (they lag ~a tick) — stops a premature bank trip + backtrack. */
         const val FURNACE_SETTLE_MS = 1800L
