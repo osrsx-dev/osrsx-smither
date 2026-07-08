@@ -1,6 +1,7 @@
 package io.osrsx.plugins.skilling
 
 import io.osrsx.api.BankingService
+import io.osrsx.api.CameraAction
 import io.osrsx.api.HIGHLIGHT_FOREVER
 import io.osrsx.api.Highlight
 import io.osrsx.api.HighlightStyle
@@ -46,7 +47,7 @@ class BlastFurnaceRoutine(
     lockInput: () -> Boolean,
     stopReason: () -> String?,
 ) {
-    private val loop = SmitherLoop(ctx, lockInput, stopReason) { step() }
+    private val loop = SmitherLoop(ctx, lockInput, stopReason, onTick = { holdCamera() }) { step() }
     private val log = PluginLog("smither")
 
     /** When we last paid the foreman (0 = never this run) — repaid a little before the 10 min lapses. */
@@ -85,9 +86,32 @@ class BlastFurnaceRoutine(
     private var coalBagChecked = false
     private var ownsCoalBag = false
     private var coalBagFilled = false
+    /** Latched while an "Empty" click on the coal bag is in flight; cleared only once the coal has ACTUALLY
+     *  landed in the inventory (or we give up after [COALBAG_EMPTY_DEADLINE_MS]). Without this latch a
+     *  misclicked Empty — the injected menu-swap default not yet settled, so the left-click fired the bag's
+     *  real default instead — cleared [coalBagFilled] with the load still trapped in the bag; step() then saw
+     *  no coal in hand, fell through to withdrawLoad, and banked a fresh load, backtracking (the reported bug). */
+    private var emptyingBag = false
+    private var emptyClickedAt = 0L
+    private var emptyStartedAt = 0L
+    /** Inventory coal count when the current Empty began — the delta baseline. The Empty is CONFIRMED only once
+     *  the inventory coal rises above it (the bag genuinely tipped its load in), never on a bare click. */
+    private var coalAtEmptyStart = 0
+    /** Fill confirmation via coal-count delta: a Fill is CONFIRMED once the BANK's coal stack drops (the bag
+     *  pulled coal out of it). A missed Fill leaves an empty bag that later yields nothing at the belt — under-
+     *  feeding a coal load and skewing the furnace's coal:ore ratio (the 81-coal-to-27-ore desync). Retried
+     *  until the delta shows, or until [COALBAG_FILL_MAX_ATTEMPTS] no-drop clicks imply the bag is already full. */
+    private var fillClickedAt = 0L
+    private var fillAttempts = 0
+    private var bankCoalAtFill = -1
 
     /** Set once we've tilted the camera overhead for the furnace — done a single time, then held frozen. */
     private var cameraFramed = false
+    /** Idle-mouse humanizer parking. Blocking only ZOOM/PITCH (below) is NOT a full camera hold, so the
+     *  idle-mouse humanizer keeps running unless told otherwise — park it explicitly so it can't fidget the
+     *  cursor off the belt mid-click, and restore its prior state on stop. */
+    private var idleMouseParked = false
+    private var idleMouseWasOn = true
 
     /** The single live target highlight — re-pointed as the current object changes (so they don't stack). */
     private var targetHl: Highlight? = null
@@ -97,16 +121,26 @@ class BlastFurnaceRoutine(
     fun releaseInput() {
         loop.releaseInput()
         clearMark()
-        ctx.cameraControl().release() // let the humanizers resume once we stop
+        ctx.cameraControl().release() // let the camera humanizer resume once we stop
+        if (idleMouseParked) { ctx.humanizers().setIdleMouse(idleMouseWasOn); idleMouseParked = false }
         cameraFramed = false
     }
 
+    /** Refreshed on EVERY loop tick via [SmitherLoop]'s onTick hook — INCLUDING the antiban-idle ticks that
+     *  return without running a [step] — so the camera lease can't lapse mid-run and let the humanizer snap
+     *  back to its own framing (the "camera reverts" bug from refreshing only inside step()). Blocks just
+     *  ZOOM + PITCH so the fixed overhead framing holds while yaw (rotate) stays free for a natural look;
+     *  separately parks the idle-mouse humanizer (a partial block wouldn't stand it down). */
+    private fun holdCamera() {
+        if (!idleMouseParked) { idleMouseWasOn = ctx.humanizers().setIdleMouse(false); idleMouseParked = true }
+        ctx.cameraControl().block(setOf(CameraAction.ZOOM, CameraAction.PITCH), CAMERA_HOLD_TTL_MS)
+    }
+
     private fun step(): Long {
-        // Freeze the background camera AND idle-mouse humanizers for the whole run: the furnace is a cramped
-        // room and an auto-rotate/zoom/fidget mid-click loses the belt (the "viewport too short" misses).
-        // hold() blocks every CameraAction, which CameraDirector reports as suspended() — the one signal both
-        // the CameraHumanizer and the IdleMouseHumanizer stand down on. Refreshed each loop (5s lease TTL).
-        ctx.cameraControl().hold()
+        // The camera + idle-mouse humanizers are parked for the whole run from the loop's per-tick hook
+        // ([holdCamera], wired into SmitherLoop.onTick), so the lease refreshes on every tick and can't lapse
+        // mid-run. We block only ZOOM + PITCH to hold the overhead framing (the cramped room needs objects to
+        // stay on-screen) while leaving yaw free, so the camera can rotate naturally as we work.
 
         stats.status = "gearing up"
         gearUp()?.let { return it }
@@ -138,6 +172,15 @@ class BlastFurnaceRoutine(
         // Once we're in the room, set a fixed overhead + fully-zoomed-out view so every furnace object
         // (belt/dispenser/coffer) stays on screen and clickable; the hold() above then keeps it there.
         frameCamera()
+
+        // The coal-bag Empty completes ASYNCHRONOUSLY: once the tipped coal lands in the inventory, holdingOre
+        // routes to feedConveyor (which outranks the `coalBagFilled` branch below), so emptyCoalBag never re-runs
+        // to notice its own success and clear the flag — leaving it to try to empty the now-empty bag again after
+        // the coal is fed (the "empties once, then attempts 3 more times" bug). Reconcile it here, before the
+        // routing: if an Empty was in flight and the bag's coal has now arrived, mark the load done.
+        if (emptyingBag && ctx.inventory().count("Coal") > coalAtEmptyStart) {
+            coalBagFilled = false; emptyingBag = false; emptyStartedAt = 0L
+        }
 
         val cofferLow = cofferRunningLow(coffer)
         cofferSecsLeft = cofferSecondsLeftFor(coffer) // for the overlay
@@ -317,9 +360,12 @@ class BlastFurnaceRoutine(
     private fun collect(bar: BlastBar): Long = ctx.profiler().section("smither/bf-collect") {
         stats.status = "collecting bars"
         closeBankIfOpen()?.let { return@section it }
-        // The Take opens the skill-multi "How many?" interface — collect the lot.
+        // The Take opens the skill-multi "How many?" interface. Two quick Spaces clear it: the first selects
+        // the default ("all") quantity and starts the take, the second dismisses the follow-up continue prompt
+        // — faster and simpler than clicking the All button and then the continue dialog separately.
         if (ctx.dialogues().makeOpen()) {
-            ctx.dialogues().makeQuantity(all = true)
+            ctx.keyboard().pressSpace()
+            ctx.keyboard().pressSpace()
             taking = false
             return@section snap(900, 1700)
         }
@@ -391,9 +437,35 @@ class BlastFurnaceRoutine(
         if (wantCoal && ownsCoalBag) {
             // The bag must be in the inventory before it can be filled — withdraw it on its own tick first.
             if (ctx.inventory().count(COAL_BAG) == 0) { bank.withdraw(COAL_BAG, 1); return@section snap(300, 700) }
-            coalBagAction("Fill")             // menu-inject Fill → the bag loads up from the bank
-            withdrawAllInjected(bank, "Coal") // then one left-click Withdraw-All fills the remaining free slots
-            coalBagFilled = true              // hold loose coal now, so step() feeds it BEFORE emptying the bag
+            // Fill the bag, CONFIRMED by the bank's coal stack dropping (the bag pulls up to 27 out of the bank).
+            // A missed Fill leaves an empty bag that yields no second coal load at the belt, under-feeding the
+            // furnace and skewing its coal:ore ratio — so retry the click until the delta shows it took. If
+            // enough clicks move no bank coal, the bag was already full (a no-op Fill can't move the stack), so
+            // treat it as filled rather than loop. coalBagFilled doubles as the "bag is loaded, empty it at the
+            // belt" flag, so it is only set once the bag genuinely holds coal.
+            if (!coalBagFilled) {
+                val bankCoal = ctx.bank().count("Coal")
+                when {
+                    bankCoalAtFill >= 0 && bankCoal < bankCoalAtFill -> { // confirmed: the bag absorbed coal
+                        coalBagFilled = true; bankCoalAtFill = -1; fillAttempts = 0
+                    }
+                    bankCoalAtFill >= 0 && System.currentTimeMillis() - fillClickedAt < ACTION_RETRY_MS ->
+                        return@section snap(300, 700) // a Fill click is in flight → wait for the bank delta
+                    fillAttempts >= COALBAG_FILL_MAX_ATTEMPTS -> { // no drop after retries → bag already full
+                        log.i("coal bag already full — proceeding")
+                        coalBagFilled = true; bankCoalAtFill = -1; fillAttempts = 0
+                    }
+                    else -> {
+                        bankCoalAtFill = bankCoal
+                        coalBagAction("Fill") // menu-inject Fill → the bag loads up from the bank
+                        fillClickedAt = System.currentTimeMillis(); fillAttempts++
+                        return@section snap(300, 700)
+                    }
+                }
+            }
+            // Bag confirmed loaded → top up the free slots with loose coal and leave HOLDING it, so step() feeds
+            // the loose coal FIRST and only then [emptyCoalBag] tips the bag's second load in at the belt.
+            withdrawAllInjected(bank, "Coal")
             bank.close()
             return@section snap(400, 1000)
         }
@@ -494,13 +566,35 @@ class BlastFurnaceRoutine(
         stats.status = "emptying coal bag"
         closeBankIfOpen()?.let { return@section it }
         closeShop()?.let { return@section it }
+
+        val coalNow = ctx.inventory().count("Coal")
+        // SUCCESS: the inventory coal has RISEN since we began emptying → the bag tipped its load in. Delta-
+        // based (not a bare "> 0"), so it holds even if a stray coal was already in hand. Only here is it safe
+        // to clear the loaded flag — the emptied coal lands a game tick after the click, so mark a feed-grace so
+        // step() waits on the "just fed, don't bank" settle branch; once it registers, holdingOre outranks the
+        // coalBagFilled branch and feedConveyor puts this second load on the belt.
+        if (emptyStartedAt != 0L && coalNow > coalAtEmptyStart) {
+            coalBagFilled = false; emptyingBag = false; emptyStartedAt = 0L
+            lastFedMs = System.currentTimeMillis()
+            return@section snap(250, 700)
+        }
+        // First entry this cycle → capture the delta baseline before the first click.
+        if (emptyStartedAt == 0L) { coalAtEmptyStart = coalNow; emptyStartedAt = System.currentTimeMillis() }
+        // A click is in flight → wait for the coal to land before re-clicking. The menu-swap Empty can miss when
+        // the injected default hasn't settled onto the live menu yet (a plain left-click then fires the bag's
+        // real default, doing nothing). Because the Fill was delta-confirmed, we KNOW the bag holds coal, so we
+        // keep re-clicking until it actually comes out instead of giving up early and skewing the coal:ore ratio.
+        if (emptyingBag && System.currentTimeMillis() - emptyClickedAt < ACTION_RETRY_MS) return@section snap(400, 900)
+        // Final safety net: if after a long window the coal STILL hasn't appeared, drop the flag and re-bank so a
+        // genuinely stuck bag can't wedge the run. The delta-confirmed Fill makes this path rare, and a re-bank
+        // finds the bag already full and re-empties it, so the load isn't lost — just deferred a trip.
+        if (System.currentTimeMillis() - emptyStartedAt > COALBAG_EMPTY_DEADLINE_MS) {
+            log.w("coal bag never emptied after retries — dropping this load and re-banking to resync")
+            coalBagFilled = false; emptyingBag = false; emptyStartedAt = 0L
+            return@section snap(300, 700)
+        }
         coalBagAction("Empty") // menu-inject Empty (left-click) — tips the bag's coal into the inventory
-        coalBagFilled = false
-        // The emptied coal lands a game tick AFTER the click, so the very next step() can read an empty-handed
-        // inventory. Mark a feed-grace so step() waits it out on the "just fed, don't bank" settle branch
-        // instead of falling through to withdrawLoad and opening the bank; once the coal registers, holdingOre
-        // outranks that branch and feedConveyor puts it on the belt.
-        lastFedMs = System.currentTimeMillis()
+        emptyingBag = true; emptyClickedAt = System.currentTimeMillis()
         snap(500, 900)
     }
 
@@ -654,8 +748,19 @@ class BlastFurnaceRoutine(
         const val PRIMARY_LOAD = 26
 
         const val ACTION_RETRY_MS = 3500L
+        /** Camera-lease TTL for the per-tick [holdCamera] refresh — comfortably longer than the loop's longest
+         *  single delay (the ~4s antiban idle) so a per-tick refresh keeps the furnace framing frozen; a clean
+         *  stop drops it immediately via release(), so only a hard crash waits this out. */
+        const val CAMERA_HOLD_TTL_MS = 8_000L
         /** Hold a menu-swap this long before/around the click so the injected default lands on the live menu. */
         const val SWAP_SETTLE_MS = 150L
+        /** Total time to keep retrying the coal-bag Empty before giving up on the load. Generous (≈4 clicks)
+         *  because the delta-confirmed Fill means the bag really does hold coal, so a missed Empty is worth
+         *  retrying rather than skewing the coal:ore ratio; only a genuinely stuck bag hits this. */
+        const val COALBAG_EMPTY_DEADLINE_MS = 15_000L
+        /** No-drop Fill clicks (bank coal unchanged) after which the bag is assumed already full — a no-op Fill
+         *  can't move the bank stack, so repeated no-drops mean the bag had coal from a prior deferred load. */
+        const val COALBAG_FILL_MAX_ATTEMPTS = 3
         /** After a load lands on the belt, wait at least this long for the furnace's varbits to register it
          *  before treating the furnace as idle (they lag ~a tick) — stops a premature bank trip + backtrack. */
         const val FURNACE_SETTLE_MS = 1800L
