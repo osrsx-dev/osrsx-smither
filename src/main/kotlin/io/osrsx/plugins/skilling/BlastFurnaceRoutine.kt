@@ -14,6 +14,8 @@ import io.osrsx.api.get
 import io.osrsx.api.section
 import io.osrsx.plugin.Plugin
 import io.osrsx.plugin.PluginLog
+import io.osrsx.plugin.Routine
+import io.osrsx.plugin.routine
 import java.awt.Color
 
 /**
@@ -44,10 +46,7 @@ class BlastFurnaceRoutine(
     private val gearUp: () -> Long?,
     private val highlight: () -> Boolean,
     private val stats: SmitherStats,
-    lockInput: () -> Boolean,
-    stopReason: () -> String?,
 ) {
-    private val loop = SmitherLoop(ctx, lockInput, stopReason, onTick = { holdCamera() }) { step() }
     private val log = PluginLog("smither")
 
     /** When we last paid the foreman (0 = never this run) — repaid a little before the 10 min lapses. */
@@ -104,9 +103,21 @@ class BlastFurnaceRoutine(
     private var fillClickedAt = 0L
     private var fillAttempts = 0
     private var bankCoalAtFill = -1
+    /** Clean-start guard: the first time the coal bag is used in a run it's emptied into the OPEN bank so any
+     *  leftover coal (a prior run, or a belt-empty that gave up) can't skew the fill/empty deltas or leave the
+     *  bag "already full". Confirmed by the bank's coal RISING (one Empty tips the whole bag); assumed already
+     *  empty after a few no-deposit clicks. Reset whenever the bag is re-acquired from the bank. */
+    private var coalBagClearedForStart = false
+    private var clearClickedAt = 0L
+    private var clearAttempts = 0
+    private var bankCoalAtClear = -1
 
-    /** Set once we've tilted the camera overhead for the furnace — done a single time, then held frozen. */
+    /** Set once we've tilted the camera overhead for the furnace; re-asserted whenever it DRIFTS off-target
+     *  (see [frameCamera] / [cameraNeedsFraming]). [framedPitch]/[framedScale] snapshot the input-driven pitch
+     *  target + zoom scale right after framing, so a later drift is a cheap delta check against them. */
     private var cameraFramed = false
+    private var framedPitch = 0
+    private var framedScale = 0
     /** Idle-mouse humanizer parking. Blocking only ZOOM/PITCH (below) is NOT a full camera hold, so the
      *  idle-mouse humanizer keeps running unless told otherwise — park it explicitly so it can't fidget the
      *  cursor off the belt mid-click, and restore its prior state on stop. */
@@ -117,105 +128,140 @@ class BlastFurnaceRoutine(
     private var targetHl: Highlight? = null
     private var targetHlKey: String? = null
 
-    fun tick(): Long = loop.tick()
     fun releaseInput() {
-        loop.releaseInput()
+        if (ctx.input().isLocked()) ctx.input().unlock()
         clearMark()
         ctx.cameraControl().release() // let the camera humanizer resume once we stop
         if (idleMouseParked) { ctx.humanizers().setIdleMouse(idleMouseWasOn); idleMouseParked = false }
         cameraFramed = false
     }
 
-    /** Refreshed on EVERY loop tick via [SmitherLoop]'s onTick hook — INCLUDING the antiban-idle ticks that
-     *  return without running a [step] — so the camera lease can't lapse mid-run and let the humanizer snap
-     *  back to its own framing (the "camera reverts" bug from refreshing only inside step()). Blocks just
-     *  ZOOM + PITCH so the fixed overhead framing holds while yaw (rotate) stays free for a natural look;
-     *  separately parks the idle-mouse humanizer (a partial block wouldn't stand it down). */
-    private fun holdCamera() {
+    /** Refreshed on EVERY loop tick via the [smitherPrologue]'s `beforeEachExtra` hook — INCLUDING the
+     *  antiban-idle AND break ticks that never run a domain step — so the camera lease can't lapse mid-run and
+     *  let the humanizer snap back to its own framing (the "camera reverts" bug from refreshing only inside a
+     *  step). Blocks just ZOOM + PITCH so the fixed overhead framing holds while yaw (rotate) stays free for a
+     *  natural look; separately parks the idle-mouse humanizer (a partial block wouldn't stand it down). */
+    fun holdCamera() {
         if (!idleMouseParked) { idleMouseWasOn = ctx.humanizers().setIdleMouse(false); idleMouseParked = true }
         ctx.cameraControl().block(setOf(CameraAction.ZOOM, CameraAction.PITCH), CAMERA_HOLD_TTL_MS)
     }
 
-    private fun step(): Long {
-        // The camera + idle-mouse humanizers are parked for the whole run from the loop's per-tick hook
-        // ([holdCamera], wired into SmitherLoop.onTick), so the lease refreshes on every tick and can't lapse
-        // mid-run. We block only ZOOM + PITCH to hold the overhead framing (the cramped room needs objects to
-        // stay on-screen) while leaving yaw free, so the camera can rotate naturally as we work.
+    /**
+     * One coherent read per tick, shared by every step (see [io.osrsx.plugin.Routine]). [gear] is sensed FIRST
+     * (before any varbit/inventory read), exactly as the old top-of-loop `gearUp()?.let { return it }` did, so a
+     * gearing tick never touches the furnace. The async coal-bag Empty reconcile — cleared once its tipped coal
+     * has actually arrived — runs here too, before any routing, so it fires every non-gearing tick the way the
+     * old `step()` ran it before its `when`.
+     */
+    private data class Snap(
+        val gear: Long?,
+        val bar: BlastBar,
+        val held: Int,
+        val barsReady: Int,
+        val oreBuffered: Int,
+        val coalBuffered: Int,
+        val cofferLow: Boolean,
+    )
 
-        stats.status = "gearing up"
-        gearUp()?.let { return it }
-
-        val bar = bar()
-        val held = ctx.inventory().count(bar.barName)
-        val coffer = ctx.varps().varbit(COFFER_VARBIT)
-        val barsReady = ctx.varps().varbit(bar.barVarbit)
-        val oreBuffered = ctx.varps().varbit(bar.oreVarbit)
-        val coalBuffered = ctx.varps().varbit(COAL_VARBIT)
-
+    /** The decision ladder in the SAME priority order as the old hand-rolled `step()`: the plugin's core
+     *  routine owns the [smitherPrologue] (and refreshes [holdCamera] every tick via its `beforeEachExtra`),
+     *  so this is a guard-less subroutine — the camera + idle-mouse humanizers stay parked for the whole run,
+     *  the lease refreshing on every tick so it can't lapse mid-run. We block only ZOOM + PITCH to hold the
+     *  overhead framing (the cramped room needs objects on-screen) while leaving yaw free. */
+    val routine: Routine<*> = routine<Snap>(
+        profiler = ctx.profiler(),
+        spanPrefix = "smither",
+        status = { stats.status = it },
+        sense = {
+            val gear = gearUp()
+            val bar = bar()
+            if (gear != null) {
+                Snap(gear, bar, 0, 0, 0, 0, false)
+            } else {
+                // The coal-bag Empty completes ASYNCHRONOUSLY: once the tipped coal lands in the inventory,
+                // holdingOre routes to feedConveyor (which outranks the `coalBagFilled` step below), so
+                // emptyCoalBag never re-runs to notice its own success and clear the flag — leaving it to try to
+                // empty the now-empty bag again after the coal is fed (the "empties once, then attempts 3 more
+                // times" bug). Reconcile it here, before the routing: if an Empty was in flight and the bag's
+                // coal has now arrived, mark the load done.
+                if (emptyingBag && ctx.inventory().count("Coal") > coalAtEmptyStart) {
+                    coalBagFilled = false; emptyingBag = false; emptyStartedAt = 0L
+                }
+                val coffer = ctx.varps().varbit(COFFER_VARBIT)
+                cofferSecsLeft = cofferSecondsLeftFor(coffer) // for the overlay
+                Snap(
+                    gear = null,
+                    bar = bar,
+                    held = ctx.inventory().count(bar.barName),
+                    barsReady = ctx.varps().varbit(bar.barVarbit),
+                    oreBuffered = ctx.varps().varbit(bar.oreVarbit),
+                    coalBuffered = ctx.varps().varbit(COAL_VARBIT),
+                    cofferLow = cofferRunningLow(coffer),
+                )
+            }
+        },
+    ) {
+        step("gearing up", { gear != null }) { gear!! }
         // Get onto an official Blast Furnace world before touching the furnace — only those run the paid
         // dwarves the coffer funds. A hop is PER-WORLD (coffer gp, buffered ore and finished bars stay on
         // the world we leave), so only hop from a clean slate; otherwise fall through and let the normal
         // steps drain what's in the furnace first, then hop on a later tick.
-        if (hopToBfWorld() && !onBlastFurnaceWorld()) {
-            val clean = held == 0 && !holdingOre(bar) && barsReady == 0 && oreBuffered == 0 && !coalBagFilled
-            if (clean) return hopToBlastFurnace()
-        }
-
+        step("hopping world", {
+            hopToBfWorld() && !onBlastFurnaceWorld() &&
+                held == 0 && !holdingOre(bar) && barsReady == 0 && oreBuffered == 0 && !coalBagFilled
+        }) { hopToBlastFurnace() }
         // Not at the furnace yet → web-walk in (the walker knows the Keldagrim routes).
-        val me = ctx.players().localPlayer()?.tile()
-        if (me == null || me.distanceTo(ANCHOR) > BF_RADIUS) {
-            stats.status = "walking"
-            ctx.webWalking().walkTo(ANCHOR)
-            return snap(300, 1100)
-        }
-
+        step("walking in", { !atFurnace() }) { walkIn() }
         // Once we're in the room, set a fixed overhead + fully-zoomed-out view so every furnace object
-        // (belt/dispenser/coffer) stays on screen and clickable; the hold() above then keeps it there.
-        frameCamera()
-
-        // The coal-bag Empty completes ASYNCHRONOUSLY: once the tipped coal lands in the inventory, holdingOre
-        // routes to feedConveyor (which outranks the `coalBagFilled` branch below), so emptyCoalBag never re-runs
-        // to notice its own success and clear the flag — leaving it to try to empty the now-empty bag again after
-        // the coal is fed (the "empties once, then attempts 3 more times" bug). Reconcile it here, before the
-        // routing: if an Empty was in flight and the bag's coal has now arrived, mark the load done.
-        if (emptyingBag && ctx.inventory().count("Coal") > coalAtEmptyStart) {
-            coalBagFilled = false; emptyingBag = false; emptyStartedAt = 0L
-        }
-
-        val cofferLow = cofferRunningLow(coffer)
-        cofferSecsLeft = cofferSecondsLeftFor(coffer) // for the overlay
-        return when {
-            // DRAIN whatever we're carrying FIRST so the inventory has a free slot before any coin/coffer
-            // withdraw — funding the coffer while holding a full ore load silently failed and looped (the
-            // "stuck withdrawing gold with a full inventory" bug).
-            // Finished bars in hand → bank them (also our stats tally point).
-            held > 0 -> bankBars(bar)
-            // The bank ran dry and we're restocking from Ordan's ore store — finish that before feeding.
-            buyingOre != null -> buyOre()
-            // Ore in hand → feed the conveyor (one click deposits the whole inventory of ore).
-            holdingOre(bar) -> feedConveyor(bar)
-            // Loose coal fed, but the coal bag still holds a load → tip it into the inventory AT THE BELT, then
-            // it feeds on the next tick (the bag's whole point: a second coal load with no extra bank trip).
-            coalBagFilled -> emptyCoalBag()
-            // Just fed the target ore → go STRAIGHT to the bar dispenser (walk-to-interact lands as "Take"
-            // opens); never bank a fresh load in the varbit-lag gap and backtrack.
-            awaitingCollect -> collect(bar)
-            // Inventory is clear now → keep the coffer funded (just-in-time by estimated drain, not 5 min
-            // early) and pay the foreman. The dwarves stop smelting on an empty coffer.
-            cofferLow -> fundCoffer()
-            // Under 60 Smithing the foreman's 2,500 gp buys 10 minutes — re-pay just before it lapses.
+        // (belt/dispenser/coffer) stays on screen and clickable; re-asserted only when it has DRIFTED.
+        step("framing camera", { cameraNeedsFraming() }) { frameCamera(); snap(200, 500) }
+        // DRAIN whatever we're carrying FIRST so the inventory has a free slot before any coin/coffer
+        // withdraw — funding the coffer while holding a full ore load silently failed and looped (the
+        // "stuck withdrawing gold with a full inventory" bug).
+        // Finished bars in hand → bank them (also our stats tally point).
+        step("banking bars", { held > 0 }) { bankBars(bar) }
+        // The bank ran dry and we're restocking from Ordan's ore store — finish that before feeding.
+        step("buying ore", { buyingOre != null }) { buyOre() }
+        // Ore in hand → feed the conveyor (one click deposits the whole inventory of ore).
+        step("feeding conveyor", { holdingOre(bar) }) { feedConveyor(bar) }
+        // Loose coal fed, but the coal bag still holds a load → tip it into the inventory AT THE BELT, then
+        // it feeds on the next tick (the bag's whole point: a second coal load with no extra bank trip).
+        step("emptying coal bag", { coalBagFilled }) { emptyCoalBag() }
+        // Just fed the target ore → go STRAIGHT to the bar dispenser (walk-to-interact lands as "Take"
+        // opens); never bank a fresh load in the varbit-lag gap and backtrack.
+        step("collecting fed", { awaitingCollect }) { collect(bar) }
+        // Inventory is clear now → keep the coffer funded (just-in-time by estimated drain, not 5 min
+        // early). The dwarves stop smelting on an empty coffer.
+        step("filling coffer", { cofferLow }) { fundCoffer() }
+        // Under 60 Smithing the foreman's 2,500 gp buys 10 minutes — re-pay just before it lapses.
+        step("paying foreman", {
             ctx.skills().real(Skill.SMITHING) in 1..59 &&
-                System.currentTimeMillis() - lastPaidMs > FOREMAN_REPAY_MS -> payForeman()
-            // Everything fed and smelted → take the batch from the dispenser.
-            barsReady > 0 && oreBuffered == 0 -> collect(bar)
-            // Ore still washing through the furnace → give it a beat.
-            oreBuffered > 0 -> { stats.status = "smelting"; snap(900, 1800) }
-            // Just fed a load but the furnace varbits haven't caught up yet (they lag a tick) → wait for them
-            // before concluding the furnace is idle and banking a fresh load (that premature trip = the backtrack).
-            System.currentTimeMillis() - lastFedMs < FURNACE_SETTLE_MS -> { stats.status = "smelting"; snap(500, 1000) }
-            // Nothing in flight → withdraw the next load (coal first while the buffer is short).
-            else -> withdrawLoad(bar, coalBuffered)
+                System.currentTimeMillis() - lastPaidMs > FOREMAN_REPAY_MS
+        }) { payForeman() }
+        // Everything fed and smelted → take the batch from the dispenser.
+        step("collecting bars", { barsReady > 0 && oreBuffered == 0 }) { collect(bar) }
+        // Ore still washing through the furnace → give it a beat.
+        step("smelting", { oreBuffered > 0 }) { stats.status = "smelting"; snap(900, 1800) }
+        // Just fed a load but the furnace varbits haven't caught up yet (they lag a tick) → wait for them
+        // before concluding the furnace is idle and banking a fresh load (that premature trip = the backtrack).
+        step("settling", { System.currentTimeMillis() - lastFedMs < FURNACE_SETTLE_MS }) {
+            stats.status = "smelting"; snap(500, 1000)
         }
+        // Nothing in flight → withdraw the next load (coal first while the buffer is short).
+        step("withdrawing", { true }) { withdrawLoad(bar, coalBuffered) }
+    }
+
+    /** Are we in the Blast Furnace room (near the anchor)? */
+    private fun atFurnace(): Boolean {
+        val me = ctx.players().localPlayer()?.tile()
+        return me != null && me.distanceTo(ANCHOR) <= BF_RADIUS
+    }
+
+    /** Web-walk into the furnace room (the walker knows the Keldagrim routes). */
+    private fun walkIn(): Long {
+        stats.status = "walking"
+        ctx.webWalking().walkTo(ANCHOR)
+        return snap(300, 1100)
     }
 
     /** Whether to top the coffer up now — by TIME LEFT, not a flat gp threshold that fired ~5 min early. The
@@ -292,7 +338,9 @@ class BlastFurnaceRoutine(
         } finally {
             ctx.menu().remove(rule)
         }
-        banking.close()
+        // Leave the bank OPEN: depositing clears our hands (held → 0), so next tick routes straight to the
+        // withdraw/coffer path. withdrawLoad's ensureBankOpen then reuses this same open bank (and closes it
+        // itself when done) instead of the bank flickering closed here and reopening a tick later.
         snap(400, 1000)
     }
 
@@ -436,7 +484,41 @@ class BlastFurnaceRoutine(
         // withdraw-all left us holding nothing, so emptyCoalBag fired at the bank and dumped the fresh coal.)
         if (wantCoal && ownsCoalBag) {
             // The bag must be in the inventory before it can be filled — withdraw it on its own tick first.
-            if (ctx.inventory().count(COAL_BAG) == 0) { bank.withdraw(COAL_BAG, 1); return@section snap(300, 700) }
+            // Re-acquiring it arms the clean-start clear below.
+            if (ctx.inventory().count(COAL_BAG) == 0) {
+                bank.withdraw(COAL_BAG, 1); coalBagClearedForStart = false; return@section snap(300, 700)
+            }
+            // Clean starting state: empty the coal bag into the OPEN bank BEFORE the first fill of the run, so
+            // leftover coal (a prior run, or a belt-empty that gave up) can't skew the fill/empty coal-count
+            // deltas or leave the bag "already full". With the bank open, Empty deposits the WHOLE bag back into
+            // the bank; confirm by the bank's coal rising, and assume the bag was already empty after a few
+            // no-deposit clicks. Only once per acquisition — the belt-empty leaves the bag empty each cycle after.
+            if (!coalBagClearedForStart) {
+                val bankCoalC = ctx.bank().count("Coal")
+                when {
+                    // In the OPEN bank a FULL bag shows "Empty", an EMPTY bag shows "Fill" — never both. No
+                    // "Empty" option ⇒ the bag is already empty ⇒ nothing to clear, it's ready to fill. (Trying
+                    // to Empty it anyway would miss the menu-swap and the left-click would DEPOSIT the whole bag,
+                    // which withdrawLoad then re-withdraws — the withdraw→deposit loop.)
+                    ctx.widgets().find(COAL_BAG, "Empty") == null -> {
+                        coalBagClearedForStart = true; bankCoalAtClear = -1; clearAttempts = 0
+                    }
+                    bankCoalAtClear >= 0 && bankCoalC > bankCoalAtClear -> { // deposited → bag emptied → clean
+                        coalBagClearedForStart = true; bankCoalAtClear = -1; clearAttempts = 0
+                    }
+                    bankCoalAtClear >= 0 && System.currentTimeMillis() - clearClickedAt < ACTION_RETRY_MS ->
+                        return@section snap(300, 700) // an Empty click is in flight → wait for the deposit
+                    clearAttempts >= COALBAG_CLEAR_MAX_ATTEMPTS -> { // no deposit after retries → already empty
+                        coalBagClearedForStart = true; bankCoalAtClear = -1; clearAttempts = 0
+                    }
+                    else -> {
+                        bankCoalAtClear = bankCoalC
+                        coalBagAction("Empty") // bank open → deposits the bag's coal back into the bank
+                        clearClickedAt = System.currentTimeMillis(); clearAttempts++
+                        return@section snap(300, 700)
+                    }
+                }
+            }
             // Fill the bag, CONFIRMED by the bank's coal stack dropping (the bag pulls up to 27 out of the bank).
             // A missed Fill leaves an empty bag that yields no second coal load at the belt, under-feeding the
             // furnace and skewing its coal:ore ratio — so retry the click until the delta shows it took. If
@@ -549,14 +631,28 @@ class BlastFurnaceRoutine(
         snap(700, 1500)
     }
 
-    /** One-time camera framing for the furnace room: fully zoom OUT (negative notches) and tilt to the most
-     *  overhead pitch this client allows, so the small room's objects never fall off-screen or behind a wall.
-     *  [step] then calls hold() every loop so the humanizer leaves this framing frozen. */
+    /** Camera framing for the furnace room: fully zoom OUT (negative notches) and tilt to the most overhead
+     *  pitch this client allows, so the small room's objects never fall off-screen or behind a wall. The
+     *  per-tick [holdCamera] lease keeps the humanizer off this framing, but if it ever DRIFTS off-target
+     *  (a lapse, an engine override, a manual nudge) [cameraNeedsFraming] re-triggers this to re-assert it. */
     private fun frameCamera() {
-        if (cameraFramed) return
         ctx.camera().zoom(-FULL_ZOOM_NOTCHES, 800) // negative = zoom OUT; wait a beat for the mouse lock
         ctx.camera().rotateToPitch(OVERHEAD_PITCH) // coerced to the client's max (most top-down)
         cameraFramed = true
+        // Snapshot the input-driven pitch target + zoom scale we just set as the "on-target" baseline; a later
+        // drift is then a cheap delta against these (rather than a magic pitch/zoom constant that a client-max
+        // coercion could invalidate into re-framing every tick).
+        framedPitch = ctx.camera().pitchTarget()
+        framedScale = ctx.camera().scale()
+    }
+
+    /** Do we need to (re-)frame? True before the first framing, or once the camera has DRIFTED beyond a small
+     *  tolerance from the baseline [frameCamera] recorded — so we re-assert the overhead pitch + full zoom-out
+     *  only when it has actually moved off-target, not every tick. */
+    private fun cameraNeedsFraming(): Boolean {
+        if (!cameraFramed) return true
+        return kotlin.math.abs(ctx.camera().pitchTarget() - framedPitch) > PITCH_DRIFT ||
+            kotlin.math.abs(ctx.camera().scale() - framedScale) > SCALE_DRIFT
     }
 
     /** After the first (loose) coal load is on the belt, tip the coal bag's stored load into the inventory so
@@ -610,6 +706,11 @@ class BlastFurnaceRoutine(
      *  still loading; logs and stays put if none are listed, so a data hiccup can't strand the run. */
     private fun hopToBlastFurnace(): Long {
         stats.status = "finding Blast Furnace world"
+        // A world hop won't go through with the bank (or shop) interface open — it wedges. Close it FIRST and
+        // hop on the next tick with a clear screen. (Gear-up opens the bank for Graceful/gloves, and bankBars
+        // now leaves it open for the following withdraw, so a hop can arrive with the bank still up.)
+        closeBankIfOpen()?.let { return it }
+        closeShop()?.let { return it }
         val worlds = ctx.worlds()
         val all = worlds.list()
         if (all.isEmpty()) return snap(600, 1200) // list not fetched yet
@@ -723,6 +824,11 @@ class BlastFurnaceRoutine(
         /** One-time furnace framing: enough wheel notches to bottom out the zoom, and the max overhead pitch. */
         const val FULL_ZOOM_NOTCHES = 15
         const val OVERHEAD_PITCH = 383 // CameraImpl coerces to the client's PITCH_MAX
+        /** How far the input pitch target may drift from the framed baseline before we re-assert the framing. */
+        const val PITCH_DRIFT = 30
+        /** How far the zoom scale may drift from the framed baseline before we re-assert the framing (scale
+         *  values run in the hundreds, so this tolerates ease-in wobble while catching a real zoom change). */
+        const val SCALE_DRIFT = 150
         const val FOREMAN = "Blast Furnace Foreman"
         const val ORDAN = "Ordan" // the ore seller inside the furnace room
         /** What Ordan's ore store stocks — everything the furnace takes except runite ore. */
@@ -761,6 +867,9 @@ class BlastFurnaceRoutine(
         /** No-drop Fill clicks (bank coal unchanged) after which the bag is assumed already full — a no-op Fill
          *  can't move the bank stack, so repeated no-drops mean the bag had coal from a prior deferred load. */
         const val COALBAG_FILL_MAX_ATTEMPTS = 3
+        /** No-deposit Empty clicks (bank coal unchanged) after which the bag is assumed already empty on the
+         *  clean-start clear — one landed Empty tips the whole bag, so repeated no-deposits mean it was empty. */
+        const val COALBAG_CLEAR_MAX_ATTEMPTS = 3
         /** After a load lands on the belt, wait at least this long for the furnace's varbits to register it
          *  before treating the furnace as idle (they lag ~a tick) — stops a premature bank trip + backtrack. */
         const val FURNACE_SETTLE_MS = 1800L

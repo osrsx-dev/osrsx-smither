@@ -7,9 +7,10 @@ import io.osrsx.config.and
 import io.osrsx.config.eq
 import io.osrsx.config.isTrue
 import io.osrsx.plugin.HasOverlay
-import io.osrsx.plugin.Plugin
 import io.osrsx.plugin.PluginDescriptor
+import io.osrsx.plugin.RoutinePlugin
 import io.osrsx.plugin.ScriptGui
+import io.osrsx.plugin.routine
 
 /**
  * Smithing plugin with two modes (mirroring the miner's normal-vs-Motherlode split):
@@ -30,7 +31,7 @@ import io.osrsx.plugin.ScriptGui
     author = "osrsx",
     tags = ["skilling", "smithing", "processing"],
 )
-class SmitherPlugin : Plugin(), HasOverlay {
+class SmitherPlugin : RoutinePlugin(), HasOverlay {
 
     object Config : PluginConfig("smither") {
         private const val ANVIL = "Anvil"
@@ -135,6 +136,9 @@ class SmitherPlugin : Plugin(), HasOverlay {
             "Outline the object the bot is currently acting on (conveyor, dispenser, coffer)",
             section = "Setup", visibleIf = eq("mode", BF))
 
+        var wearGraceful by boolItem("wearGraceful", "Wear Graceful outfit", true,
+            "Equip your Graceful (agility) clothing while working, if you own it", section = "Setup")
+
         var lockInput by boolItem("lockInput", "Lock user input", false,
             "While running, ignore physical mouse/keyboard input so it can't disrupt the bot", section = "Antiban")
 
@@ -156,6 +160,8 @@ class SmitherPlugin : Plugin(), HasOverlay {
             ctx,
             wantHammer = { !Config.isBlastFurnace && Config.getHammer },
             wantIceGloves = { Config.isBlastFurnace && Config.iceGloves },
+            blastFurnace = { Config.isBlastFurnace },
+            wantGraceful = { Config.wearGraceful },
         )
     }
     private val stops by lazy {
@@ -187,8 +193,6 @@ class SmitherPlugin : Plugin(), HasOverlay {
             buyBatch = { Config.buyBatch },
             gearUp = { gearUp() },
             stats = stats,
-            lockInput = { Config.lockInput },
-            stopReason = { stops.reason() },
         )
     }
 
@@ -202,9 +206,36 @@ class SmitherPlugin : Plugin(), HasOverlay {
             gearUp = { gearUp() },
             highlight = { Config.highlightObjects },
             stats = stats,
-            lockInput = { Config.lockInput },
-            stopReason = { stops.reason() },
         )
+    }
+
+    /** The single "core" routine: the shared [smitherPrologue] guards (login/yield/stop/break/dialogue/idle)
+     *  plus a per-tick camera-hold refresh for the Blast Furnace, then a subroutine per mode. A
+     *  [RoutinePlugin] drives it — onStart/onStop/onLoop are wired for us; the routine's own onStart/onStop
+     *  hooks carry stats init and input/camera release. */
+    private val core by lazy {
+        routine(ctx.profiler(), "smither", status = { stats.status = it }) {
+            smitherPrologue(
+                ctx,
+                lockInput = { Config.lockInput },
+                stopReason = { stops.reason() },
+                beforeEachExtra = { if (Config.isBlastFurnace) furnace.holdCamera() },
+            )
+            onStart {
+                stats.start()
+                stats.carried = {
+                    if (Config.isBlastFurnace) inventory.count(currentBlastBar().barName)
+                    else currentProduct()?.let { inventory.count(it.itemName(currentBar())) } ?: 0
+                }
+                refreshBarPrice()
+            }
+            onStop {
+                anvil.releaseInput()
+                furnace.releaseInput()
+            }
+            subroutine("blast furnace", { Config.isBlastFurnace }, furnace.routine)
+            subroutine("anvil", { true }, anvil.routine)
+        }
     }
 
     /** The chosen bar's live GE guide price, fetched ONCE at start and on a target change — not per overlay
@@ -217,14 +248,7 @@ class SmitherPlugin : Plugin(), HasOverlay {
         return barPrice
     }
 
-    override fun onStart() {
-        stats.start()
-        stats.carried = {
-            if (Config.isBlastFurnace) inventory.count(currentBlastBar().barName)
-            else currentProduct()?.let { inventory.count(it.itemName(currentBar())) } ?: 0
-        }
-        refreshBarPrice()
-    }
+    override fun routine() = core
 
     /** Reset the item to "first eligible" when the metal changes — a label for the old metal is invalid.
      *  Re-price when the Blast Furnace bar (or mode) changes so GP/hr tracks the new target. */
@@ -232,14 +256,6 @@ class SmitherPlugin : Plugin(), HasOverlay {
         if (key == "bar") Config.item = ""
         if (key == "bfBar" || key == "mode") refreshBarPrice()
     }
-
-    override fun onStop() {
-        anvil.releaseInput()
-        furnace.releaseInput()
-    }
-
-    override fun onLoop(): Long =
-        if (Config.isBlastFurnace) furnace.tick() else anvil.tick()
 
     override fun overlayTitle() = "Smithing"
 
