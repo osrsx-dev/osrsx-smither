@@ -6,10 +6,10 @@ import io.osrsx.config.PluginConfig
 import io.osrsx.config.and
 import io.osrsx.config.eq
 import io.osrsx.config.isTrue
-import io.osrsx.plugin.HasOverlay
+import io.osrsx.plugin.Gfx2D
+import io.osrsx.plugin.HasPanel
 import io.osrsx.plugin.PluginDescriptor
 import io.osrsx.plugin.RoutinePlugin
-import io.osrsx.plugin.ScriptGui
 import io.osrsx.plugin.routine
 
 /**
@@ -31,7 +31,7 @@ import io.osrsx.plugin.routine
     author = "osrsx",
     tags = ["skilling", "smithing", "processing"],
 )
-class SmitherPlugin : RoutinePlugin(), HasOverlay {
+class SmitherPlugin : RoutinePlugin(), HasPanel {
 
     object Config : PluginConfig("smither") {
         private const val ANVIL = "Anvil"
@@ -257,9 +257,7 @@ class SmitherPlugin : RoutinePlugin(), HasOverlay {
         if (key == "bfBar" || key == "mode") refreshBarPrice()
     }
 
-    override fun overlayTitle() = "Smithing"
-
-    override fun onOverlay(gui: ScriptGui) = profile("smither/overlay") {
+    override fun onPanel(gfx: Gfx2D) = profile("smither/overlay") {
         val rows = if (Config.isBlastFurnace) {
             val price = barPriceOrRefresh() // cached at start / on target change, not looked up per frame
             listOf(
@@ -277,6 +275,6 @@ class SmitherPlugin : RoutinePlugin(), HasOverlay {
                 "Made" to SmitherOverlay.commas(stats.produced()),
             )
         }
-        SmitherOverlay.render(gui, stats, rows)
+        gfx.overlay("Smithing") { g -> SmitherOverlay.render(g, stats, rows) }
     }
 }
