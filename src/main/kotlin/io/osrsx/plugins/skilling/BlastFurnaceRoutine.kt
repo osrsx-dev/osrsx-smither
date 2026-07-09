@@ -496,6 +496,13 @@ class BlastFurnaceRoutine(
             if (!coalBagClearedForStart) {
                 val bankCoalC = ctx.bank().count("Coal")
                 when {
+                    // In the OPEN bank a FULL bag shows "Empty", an EMPTY bag shows "Fill" — never both. No
+                    // "Empty" option ⇒ the bag is already empty ⇒ nothing to clear, it's ready to fill. (Trying
+                    // to Empty it anyway would miss the menu-swap and the left-click would DEPOSIT the whole bag,
+                    // which withdrawLoad then re-withdraws — the withdraw→deposit loop.)
+                    ctx.widgets().find(COAL_BAG, "Empty") == null -> {
+                        coalBagClearedForStart = true; bankCoalAtClear = -1; clearAttempts = 0
+                    }
                     bankCoalAtClear >= 0 && bankCoalC > bankCoalAtClear -> { // deposited → bag emptied → clean
                         coalBagClearedForStart = true; bankCoalAtClear = -1; clearAttempts = 0
                     }
