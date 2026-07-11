@@ -8,7 +8,6 @@ import io.osrsx.config.eq
 import io.osrsx.config.isTrue
 import io.osrsx.plugin.Gfx2D
 import io.osrsx.plugin.HasPanel
-import io.osrsx.plugin.PluginDescriptor
 import io.osrsx.plugin.RoutinePlugin
 import io.osrsx.plugin.routine
 
@@ -25,12 +24,6 @@ import io.osrsx.plugin.routine
  * Gears via the Loadout API ([SmithGear]) and shows a live stats overlay. Every loop is profiled under
  * `smither/…` spans (zero-overhead when profiling is off).
  */
-@PluginDescriptor(
-    name = "Smither",
-    description = "Smiths items at an anvil, or smelts bars at the Blast Furnace.",
-    author = "osrsx",
-    tags = ["skilling", "smithing", "processing"],
-)
 class SmitherPlugin : RoutinePlugin(), HasPanel {
 
     object Config : PluginConfig("smither") {
