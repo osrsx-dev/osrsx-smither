@@ -2,6 +2,7 @@ apply plugin: 'io.osrsx.plugin'
 
 osrsxPlugin {
     id = 'smither'
+    main = 'io.osrsx.plugins.skilling.SmitherPlugin'
     group = 'io.osrsx.plugins'
     version = '2.0.0'
     name = 'Smither'
